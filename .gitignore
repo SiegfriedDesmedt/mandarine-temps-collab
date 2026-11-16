@@ -1,0 +1,17 @@
+# Secrets et configuration locale
+.env
+
+# Données générées par l'application
+/data/
+/reporting/runtime/
+/reporting/dist/data.json
+/_backup/
+/_refactor_reference/
+/outputs/
+/runtime/
+/Sources/
+/.venv/
+__pycache__/
+*.py[cod]
+*.log
+/.vscode/

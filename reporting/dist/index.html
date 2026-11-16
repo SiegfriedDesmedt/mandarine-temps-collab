@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f66729" />
+    <title>Mandarine — Temps & coûts</title>
+    <meta
+      name="description"
+      content="Pilotage des temps, coûts, revenus et points de vigilance collaborateurs."
+    />
+    <link rel="stylesheet" href="styles.css?v=20261028-1" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Navigation principale">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span>M</span></div>
+          <div>
+            <strong>Mandarine</strong>
+            <small>Temps & coûts</small>
+          </div>
+        </div>
+
+        <nav class="main-nav">
+          <button class="nav-item is-active" data-view="overview" type="button">
+            <span class="nav-icon" aria-hidden="true">⌁</span>
+            Synthèse
+          </button>
+          <button class="nav-item" data-view="collaborators" type="button">
+            <span class="nav-icon" aria-hidden="true">◎</span>
+            Collaborateurs
+          </button>
+          <button class="nav-item" data-view="projects" type="button">
+            <span class="nav-icon" aria-hidden="true">▦</span>
+            Projets & clients
+          </button>
+          <button class="nav-item" data-view="admin" type="button">
+            <span class="nav-icon" aria-hidden="true">⚙</span>
+            Administration
+            <span class="nav-status-dot" id="admin-status-dot" aria-label="État du backend"></span>
+          </button>
+        </nav>
+
+        <div class="sidebar-spacer"></div>
+
+        <div class="connection-card">
+          <div class="connection-head">
+            <span class="status-dot"></span>
+            <span>Sources Odoo & Sellsy</span>
+          </div>
+          <p>Les indicateurs utilisent uniquement les imports publiés dans Sources.</p>
+          <button type="button" id="open-sources">Gérer les imports</button>
+        </div>
+
+        <div class="user-card">
+          <div class="avatar">SD</div>
+          <div>
+            <strong>Siegfried</strong>
+            <small>Administrateur</small>
+          </div>
+          <span aria-hidden="true">•••</span>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div>
+            <button class="mobile-menu" id="mobile-menu" type="button" aria-label="Ouvrir le menu">☰</button>
+            <p class="eyebrow" id="view-eyebrow">Pilotage opérationnel</p>
+            <h1 id="view-title">Synthèse des Facturations et Coûts</h1>
+            <p class="subtitle" id="view-subtitle">Chargement des données…</p>
+          </div>
+          <div class="topbar-actions">
+            <button class="icon-button" type="button" aria-label="Notifications">
+              <span aria-hidden="true">◌</span>
+              <span class="notification-dot"></span>
+            </button>
+            <button class="secondary-button" id="export-button" type="button">
+              <span aria-hidden="true">⇩</span> Exporter
+            </button>
+          </div>
+        </header>
+
+        <section class="filter-bar" aria-label="Filtres du rapport">
+          <label id="period-filter-field">
+            <span>Période</span>
+            <select id="period-filter">
+              <option value="fy">Exercice en cours</option>
+            </select>
+          </label>
+          <label id="bu-filter-field">
+            <span>Business unit</span>
+            <select id="bu-filter"><option value="all">Toutes les BU</option></select>
+          </label>
+          <label class="search-field" id="search-filter-field">
+            <span>Recherche</span>
+            <span class="search-box">
+              <span aria-hidden="true">⌕</span>
+              <input id="search-filter" type="search" placeholder="Client, projet, collaborateur…" />
+            </span>
+          </label>
+          <button class="reset-button" id="reset-filters" type="button">Réinitialiser</button>
+        </section>
+
+        <div id="app-view" aria-live="polite">
+          <div class="loading-state">
+            <div class="loader"></div>
+            <p>Consolidation des sources Odoo et Sellsy…</p>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script src="app.js?v=20261028-1" defer></script>
+  </body>
+</html>
