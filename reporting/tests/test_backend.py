@@ -40,6 +40,7 @@ from core.odoo_exporter import (
 from reporting.backend.report_builder import (
     SOURCE_FILES,
     _is_absence_time,
+    _is_internal_project,
     _is_labor_employee,
     build_payload,
     fiscal_period,
@@ -50,6 +51,7 @@ from reporting.backend.report_builder import (
     working_day_count,
 )
 from core.sellsy_importer import get_configuration as get_sellsy_configuration, import_sellsy
+from core.source_database import build_source_database, read_table
 from reporting.backend.source_freshness import collect_source_freshness
 from configure_odoo import save_env_values
 
@@ -122,6 +124,8 @@ class OdooExporterTests(unittest.TestCase):
             return "integer"
         if field == "x_num_sellsy":
             return "char"
+        if field == "x_bu_projet":
+            return "many2one"
         if field.endswith("_ids"):
             return "many2many"
         if field.endswith("_id") or field == "so_line":
@@ -180,7 +184,7 @@ class OdooExporterTests(unittest.TestCase):
                 "display_name": "[COUT-ACQ] Coût acquisition projet",
             }
         if model == "project.project":
-            return {**base, "user_id": [9, "Responsable"], "partner_id": [20, "Client"], "sale_line_id": [501, "Ligne"], "sale_order_id": [601, "Commande"]}
+            return {**base, "user_id": [9, "Responsable"], "partner_id": [20, "Client"], "x_bu_projet": [3, "MANDARINE INTERNE"], "sale_line_id": [501, "Ligne"], "sale_order_id": [601, "Commande"]}
         if model == "project.task":
             return {
                 **base,
@@ -332,6 +336,8 @@ class OdooExporterTests(unittest.TestCase):
                 if spec.filename in {"projets.csv", "taches.csv"}:
                     self.assertNotIn("user_id", reader.fieldnames)
                     self.assertEqual(row["employee_id"], "8")
+                if spec.filename == "projets.csv":
+                    self.assertEqual(row["x_bu_projet"], "MANDARINE INTERNE")
                 if spec.filename == "clients.csv":
                     self.assertEqual(
                         reader.fieldnames,
@@ -583,6 +589,76 @@ class SellsyApiImporterTests(unittest.TestCase):
             config = get_sellsy_configuration()
         self.assertEqual(config["auth_mode"], "oauth2_client_credentials")
         self.assertEqual(config["workers"], 2)
+        self.assertFalse(config["experience_configured"])
+
+    def test_experience_credentials_must_be_complete(self):
+        with patch.dict(
+            os.environ,
+            {**self.ENV, "SELLSY_EXPERIENCE_CLIENT_ID": "experience-client"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(Exception, "SELLSY_EXPERIENCE_CLIENT_SECRET"):
+                get_sellsy_configuration()
+
+    def test_experience_orders_are_merged_in_a_distinct_identifier_namespace(self):
+        class ExperienceClient(self.FakeClient):
+            def search_endpoint(self, path, *, filters, query=None):
+                self.searches.append({"path": path, "filters": filters, "query": query})
+                self.asserted_path = path
+                return {
+                    "data": [{
+                        "id": 1,
+                        "number": "BDCEXP0006",
+                        "date": "2026-10-01",
+                        "company_name": "Client Expérience",
+                        "subject": "Projet expérience",
+                        "amounts": {"total_excl_tax": "500.00"},
+                        "related": [{"type": "company", "id": 99}],
+                        "status": "accepted",
+                    }],
+                    "pagination": {"total": 1, "count": 1, "offset": None},
+                }
+
+        environment = {
+            **self.ENV,
+            "SELLSY_EXPERIENCE_CLIENT_ID": "experience-client",
+            "SELLSY_EXPERIENCE_CLIENT_SECRET": "experience-secret",
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, environment, clear=True
+        ):
+            destination = Path(directory) / "sellsy"
+            experience = ExperienceClient()
+            result = import_sellsy(
+                destination_dir=destination,
+                client=self.FakeClient(),
+                experience_client=experience,
+            )
+            workbook = openpyxl.load_workbook(
+                destination / "orders.xlsx", read_only=True, data_only=True
+            )
+            try:
+                values = list(workbook.active.iter_rows(values_only=True))
+                headers = list(values[0])
+                identifiers = {str(row[headers.index("ID")]) for row in values[1:]}
+                numbers = {str(row[headers.index("Numéro")]) for row in values[1:]}
+            finally:
+                workbook.close()
+
+            storage = Path(directory) / "sellsy.sqlite.gz"
+            build_source_database(
+                "sellsy", storage, destination, full_sync=True
+            )
+            stored_identifiers = {
+                row["id"] for row in read_table(storage, "sellsy_orders")
+            }
+
+        self.assertEqual(identifiers, {"1", "-1"})
+        self.assertEqual(stored_identifiers, {"1", "-1"})
+        self.assertIn("BDCEXP0006", numbers)
+        self.assertEqual(experience.asserted_path, "/orders/search")
+        orders_result = next(item for item in result["files"] if item["source"] == "orders")
+        self.assertEqual(orders_result["experience_records"], 1)
 
     def test_three_api_categories_are_published_as_workbooks_only(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, self.ENV, clear=True):
@@ -838,6 +914,12 @@ class ReportBuilderTests(unittest.TestCase):
         self.assertTrue(_is_absence_time("ABSENCE / RTT", ""))
         self.assertFalse(_is_absence_time("Client Alpha", "Production"))
 
+    def test_internal_project_classification_uses_odoo_business_fields(self):
+        self.assertTrue(_is_internal_project({"name": "PROJET INTERNE", "client": "Client", "x_bu_projet": ""}))
+        self.assertTrue(_is_internal_project({"name": "Projet", "client": "Mandarine Academy", "x_bu_projet": ""}))
+        self.assertTrue(_is_internal_project({"name": "Projet", "client": "Client", "x_bu_projet": "MANDARINE INTERNE"}))
+        self.assertFalse(_is_internal_project({"name": "MANDEXP - Client", "client": "Client externe", "x_bu_projet": "Mandarine Expérience"}))
+
     def test_sellsy_references_are_exact_text_keys_and_support_explicit_lists(self):
         self.assertEqual(parse_sellsy_references(" BDC-001 | 00042 "), ["bdc-001", "00042"])
         self.assertEqual(technical_key(" 00042 "), "00042")
@@ -935,7 +1017,7 @@ class ReportBuilderTests(unittest.TestCase):
             self.assertEqual(payload["meta"]["sellsyDocumentStartDate"], "2021-01-01")
             self.assertEqual(payload["meta"]["reportSchemaVersion"], 4)
             self.assertEqual(payload["meta"]["businessRules"]["timesheetControl"]["dailyHours"], 7.67)
-            self.assertEqual(payload["meta"]["rulesetVersion"], 3)
+            self.assertEqual(payload["meta"]["rulesetVersion"], 4)
             self.assertEqual(
                 payload["meta"]["businessRules"]["timesheetControl"]["overageWatchThreshold"],
                 108.0,

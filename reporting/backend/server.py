@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,7 +28,15 @@ from core.sellsy_importer import (
     import_sellsy,
 )
 from core.snapshot_store import active_source_provenance
+from core.synchronization_check import run_synchronization_check
+from core.source_database import (
+    DATABASE_FILENAMES,
+    STORAGE_SCHEMA_VERSION,
+    build_source_database,
+    validate_source_database,
+)
 from core.source_revision_store import (
+    active_revision,
     create_staging_revision,
     file_descriptor,
     promote_revision,
@@ -39,8 +47,8 @@ from .source_freshness import collect_source_freshness
 
 APP_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = APP_DIR.parent
-ENV_FILE = APP_DIR / ".env"
-LEGACY_ENV_FILE = REPO_ROOT / ".env"
+ENV_FILE = REPO_ROOT / ".env"
+LEGACY_ENV_FILE = APP_DIR / ".env"
 PROJECT_CONFIG_KEYS = {
     "ODOO_LOGIN",
     "ODOO_PASSWORD",
@@ -52,8 +60,12 @@ PROJECT_CONFIG_KEYS = {
     "ADMIN_API_TOKEN",
     "SELLSY_CLIENT_ID",
     "SELLSY_CLIENT_SECRET",
+    "SELLSY_EXPERIENCE_CLIENT_ID",
+    "SELLSY_EXPERIENCE_CLIENT_SECRET",
     "SELLSY_API_TIMEOUT_SECONDS",
     "SELLSY_API_WORKERS",
+    "SOURCE_FULL_SYNC_INTERVAL_DAYS",
+    "SOURCE_SYNC_OVERLAP_MINUTES",
 }
 EXTERNAL_CONFIG = {
     key: os.environ[key]
@@ -93,8 +105,13 @@ def utc_now() -> str:
 def safe_error(error: Exception) -> str:
     message = str(error)
     for key in (
+        "ODOO_LOGIN",
         "ODOO_PASSWORD",
+        "SELLSY_CLIENT_ID",
         "SELLSY_CLIENT_SECRET",
+        "SELLSY_EXPERIENCE_CLIENT_ID",
+        "SELLSY_EXPERIENCE_CLIENT_SECRET",
+        "ADMIN_API_TOKEN",
     ):
         secret = os.environ.get(key, "")
         if secret:
@@ -114,7 +131,105 @@ def latest_running_job(integration: str | None = None) -> dict | None:
     )
 
 
-def run_odoo_job(run_id: str) -> None:
+def _synchronization_plan(
+    source: str,
+    *,
+    now: datetime | None = None,
+    force_full: bool = False,
+) -> dict:
+    now = now or datetime.now(timezone.utc)
+    interval_days = max(1, int(os.environ.get("SOURCE_FULL_SYNC_INTERVAL_DAYS", "7")))
+    overlap_minutes = max(0, int(os.environ.get("SOURCE_SYNC_OVERLAP_MINUTES", "10")))
+    revision = active_revision(source)
+    if not revision:
+        return {
+            "full_sync": True,
+            "since": None,
+            "cursor": None,
+            "full_sync_at": None,
+            "overlap_minutes": overlap_minutes,
+            "base_revision_id": None,
+            "base_revision_dir": None,
+            "schema_upgrade_required": False,
+            "experience_bootstrap_required": False,
+            "requested_full_reconciliation": bool(force_full),
+        }
+
+    manifest = revision["manifestData"]
+    synchronization = manifest.get("synchronization") or {}
+    cursor_text = synchronization.get("cursor") or manifest.get("completedAt")
+    full_sync_text = synchronization.get("fullSyncAt") or manifest.get("completedAt")
+    try:
+        cursor = datetime.fromisoformat(str(cursor_text).replace("Z", "+00:00"))
+        full_sync_at = datetime.fromisoformat(str(full_sync_text).replace("Z", "+00:00"))
+        if cursor.tzinfo is None:
+            cursor = cursor.replace(tzinfo=timezone.utc)
+        if full_sync_at.tzinfo is None:
+            full_sync_at = full_sync_at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        cursor = None
+        full_sync_at = None
+    try:
+        stored_schema_version = int(
+            (manifest.get("storage") or {}).get("schemaVersion") or 0
+        )
+    except (TypeError, ValueError):
+        stored_schema_version = 0
+    schema_upgrade_required = stored_schema_version < STORAGE_SCHEMA_VERSION
+    experience_enabled = bool(
+        os.environ.get("SELLSY_EXPERIENCE_CLIENT_ID", "").strip()
+        and os.environ.get("SELLSY_EXPERIENCE_CLIENT_SECRET", "").strip()
+    )
+    experience_bootstrap_required = bool(
+        source == "sellsy"
+        and experience_enabled
+        and not synchronization.get("sellsyExperienceConfigured")
+    )
+    full_sync = bool(
+        force_full
+        or schema_upgrade_required
+        or experience_bootstrap_required
+        or not cursor
+        or not full_sync_at
+        or now - full_sync_at >= timedelta(days=interval_days)
+    )
+    since = None if full_sync else cursor - timedelta(minutes=overlap_minutes)
+    return {
+        "full_sync": full_sync,
+        "since": since,
+        "cursor": cursor,
+        "full_sync_at": full_sync_at,
+        "overlap_minutes": overlap_minutes,
+        "base_revision_id": revision["revisionId"],
+        "base_revision_dir": Path(revision["path"]),
+        "schema_upgrade_required": schema_upgrade_required,
+        "experience_bootstrap_required": experience_bootstrap_required,
+        "requested_full_reconciliation": bool(force_full),
+    }
+
+
+def _sync_manifest(result: dict, plan: dict) -> dict:
+    cursor = result["started_at"]
+    synchronization = {
+        "mode": "full" if plan["full_sync"] else "incremental",
+        "cursor": cursor,
+        "fullSyncAt": cursor if plan["full_sync"] else plan["full_sync_at"].isoformat(),
+        "overlapMinutes": plan["overlap_minutes"],
+        "baseRevisionId": plan["base_revision_id"],
+        "changedRecords": result["rows"],
+        "deletionStrategy": "full-reconciliation-periodic",
+        "requestedFullReconciliation": bool(
+            plan.get("requested_full_reconciliation")
+        ),
+    }
+    if "experience_configured" in result:
+        synchronization["sellsyExperienceConfigured"] = bool(
+            result["experience_configured"]
+        )
+    return synchronization
+
+
+def run_odoo_job(run_id: str, force_full: bool = False) -> None:
     refresh_project_env()
     started_at = utc_now()
     STORE.update(run_id, status="running", stage="authentication", started_at=started_at)
@@ -127,14 +242,39 @@ def run_odoo_job(run_id: str) -> None:
             last_odoo_id=update.get("last_odoo_id"),
         )
 
-    revision_id, staging_dir = create_staging_revision("odoo")
+    staging_dir = None
     try:
-        result = export_odoo(progress, destination_dir=staging_dir)
+        plan = _synchronization_plan("odoo", force_full=force_full)
+        revision_id, staging_dir = create_staging_revision("odoo")
+        delta_dir = staging_dir / "delta"
+        modified_since = (
+            plan["since"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            if plan["since"]
+            else None
+        )
+        result = export_odoo(
+            progress,
+            destination_dir=delta_dir,
+            modified_since=modified_since,
+        )
+        STORE.update(run_id, stage="storage:sqlite", changed_rows=result["rows"])
+        database_file = staging_dir / DATABASE_FILENAMES["odoo"]
+        database = build_source_database(
+            "odoo",
+            database_file,
+            delta_dir,
+            base_revision_dir=plan["base_revision_dir"],
+            full_sync=plan["full_sync"],
+            metadata={
+                "revision_id": revision_id,
+                "sync_cursor": result["started_at"],
+                "sync_mode": "full" if plan["full_sync"] else "incremental",
+            },
+        )
+        validate_source_database(database_file, "odoo")
+        shutil.rmtree(delta_dir, ignore_errors=True)
         STORE.update(run_id, stage="validation:manifest", revision_id=revision_id)
-        required = [
-            "clients.csv", "commandes.csv", "lignes_commandes.csv", "projets.csv",
-            "taches.csv", "temps.csv", "couts_fixes.csv", "collaborateurs.csv",
-        ]
+        required = [DATABASE_FILENAMES["odoo"]]
         files = [file_descriptor(path, relative_to=staging_dir) for path in sorted(staging_dir.iterdir()) if path.is_file()]
         write_revision_manifest(staging_dir, {
             "schemaVersion": 2,
@@ -143,9 +283,21 @@ def run_odoo_job(run_id: str) -> None:
             "status": "validated",
             "startedAt": result["started_at"],
             "completedAt": result["completed_at"],
-            "records": result["rows"],
+            "records": database["records"],
             "files": files,
-            "checks": {"requiredFiles": True, "readOnlyConnector": True},
+            "storage": {
+                "format": database["format"],
+                "schemaVersion": database["schema_version"],
+                "database": DATABASE_FILENAMES["odoo"],
+                "tables": database["counts"],
+                "migratedLegacyRevision": database["migrated_legacy"],
+            },
+            "synchronization": _sync_manifest(result, plan),
+            "checks": {
+                "requiredFiles": True,
+                "sqliteIntegrity": True,
+                "readOnlyConnector": True,
+            },
         })
         final_dir, _previous = promote_revision("odoo", revision_id, staging_dir, required)
         total_size = sum(path.stat().st_size for path in final_dir.iterdir() if path.is_file())
@@ -155,7 +307,9 @@ def run_odoo_job(run_id: str) -> None:
             stage="completed",
             completed_at=result["completed_at"],
             duration_seconds=result["duration_seconds"],
-            rows=result["rows"],
+            rows=database["records"],
+            changed_rows=result["rows"],
+            sync_mode="full" if plan["full_sync"] else "incremental",
             last_odoo_id=result["last_odoo_id"],
             file_name=f"Révision Odoo {revision_id}",
             file_size_bytes=total_size,
@@ -174,19 +328,23 @@ def run_odoo_job(run_id: str) -> None:
             error=safe_error(error),
         )
     finally:
-        if staging_dir.exists():
+        if staging_dir and staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
 
 
-def start_odoo_job() -> tuple[dict | None, str | None]:
+def start_odoo_job(*, force_full: bool = False) -> tuple[dict | None, str | None]:
     with JOB_LOCK:
         running = latest_running_job()
         if running:
             return None, running["id"]
         record = STORE.create("odoo_timesheets")
+        record = STORE.update(
+            record["id"],
+            requested_sync_mode="full" if force_full else "automatic",
+        ) or record
         thread = threading.Thread(
             target=run_odoo_job,
-            args=(record["id"],),
+            args=(record["id"], force_full),
             name=f"odoo-export-{record['id'][:8]}",
             daemon=True,
         )
@@ -194,7 +352,7 @@ def start_odoo_job() -> tuple[dict | None, str | None]:
         return record, None
 
 
-def run_sellsy_job(run_id: str) -> None:
+def run_sellsy_job(run_id: str, force_full: bool = False) -> None:
     refresh_project_env()
     started_at = utc_now()
     pending_files = [
@@ -218,11 +376,35 @@ def run_sellsy_job(run_id: str) -> None:
             total=int(update.get("total", 0)),
         )
 
-    revision_id, staging_dir = create_staging_revision("sellsy")
+    staging_dir = None
     try:
-        result = import_sellsy(progress, destination_dir=staging_dir)
+        plan = _synchronization_plan("sellsy", force_full=force_full)
+        revision_id, staging_dir = create_staging_revision("sellsy")
+        delta_dir = staging_dir / "delta"
+        updated_since = plan["since"].isoformat() if plan["since"] else None
+        result = import_sellsy(
+            progress,
+            destination_dir=delta_dir,
+            updated_since=updated_since,
+        )
+        STORE.update(run_id, stage="storage:sqlite", files=result["files"], changed_rows=result["rows"])
+        database_file = staging_dir / DATABASE_FILENAMES["sellsy"]
+        database = build_source_database(
+            "sellsy",
+            database_file,
+            delta_dir,
+            base_revision_dir=plan["base_revision_dir"],
+            full_sync=plan["full_sync"],
+            metadata={
+                "revision_id": revision_id,
+                "sync_cursor": result["started_at"],
+                "sync_mode": "full" if plan["full_sync"] else "incremental",
+            },
+        )
+        validate_source_database(database_file, "sellsy")
+        shutil.rmtree(delta_dir, ignore_errors=True)
         STORE.update(run_id, stage="validation:manifest", files=result["files"], revision_id=revision_id)
-        required = ["orders.xlsx", "invoices.xlsx", "credit-notes.xlsx"]
+        required = [DATABASE_FILENAMES["sellsy"]]
         files = [file_descriptor(path, relative_to=staging_dir) for path in sorted(staging_dir.iterdir()) if path.is_file()]
         write_revision_manifest(staging_dir, {
             "schemaVersion": 2,
@@ -231,10 +413,23 @@ def run_sellsy_job(run_id: str) -> None:
             "status": "validated",
             "startedAt": result["started_at"],
             "completedAt": result["completed_at"],
-            "records": result["rows"],
+            "records": database["records"],
             "files": files,
             "categories": result["files"],
-            "checks": {"requiredFiles": True, "completePagination": True, "readOnlyConnector": True},
+            "storage": {
+                "format": database["format"],
+                "schemaVersion": database["schema_version"],
+                "database": DATABASE_FILENAMES["sellsy"],
+                "tables": database["counts"],
+                "migratedLegacyRevision": database["migrated_legacy"],
+            },
+            "synchronization": _sync_manifest(result, plan),
+            "checks": {
+                "requiredFiles": True,
+                "sqliteIntegrity": True,
+                "completePagination": True,
+                "readOnlyConnector": True,
+            },
         })
         final_dir, _previous = promote_revision("sellsy", revision_id, staging_dir, required)
         total_size = sum(path.stat().st_size for path in final_dir.iterdir() if path.is_file())
@@ -247,6 +442,9 @@ def run_sellsy_job(run_id: str) -> None:
             file_name=f"Révision Sellsy {revision_id}",
             file_size_bytes=total_size,
             files=result["files"],
+            rows=database["records"],
+            changed_rows=result["rows"],
+            sync_mode="full" if plan["full_sync"] else "incremental",
             auth_mode=result["auth_mode"],
             revision_id=revision_id,
             report_generated_at=None,
@@ -264,19 +462,23 @@ def run_sellsy_job(run_id: str) -> None:
             error=safe_error(error),
         )
     finally:
-        if staging_dir.exists():
+        if staging_dir and staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
 
 
-def start_sellsy_job() -> tuple[dict | None, str | None]:
+def start_sellsy_job(*, force_full: bool = False) -> tuple[dict | None, str | None]:
     with JOB_LOCK:
         running = latest_running_job()
         if running:
             return None, running["id"]
         record = STORE.create("sellsy_sources")
+        record = STORE.update(
+            record["id"],
+            requested_sync_mode="full" if force_full else "automatic",
+        ) or record
         thread = threading.Thread(
             target=run_sellsy_job,
-            args=(record["id"],),
+            args=(record["id"], force_full),
             name=f"sellsy-import-{record['id'][:8]}",
             daemon=True,
         )
@@ -331,10 +533,63 @@ def start_report_job() -> tuple[dict | None, str | None]:
         return record, None
 
 
+def run_sync_check_job(run_id: str) -> None:
+    refresh_project_env()
+    started_at = utc_now()
+    STORE.update(run_id, status="running", stage="connectivity", started_at=started_at)
+    started_monotonic = time.monotonic()
+    try:
+        result = run_synchronization_check()
+        for source_result in result.get("sources", {}).values():
+            if source_result.get("error"):
+                source_result["error"] = safe_error(RuntimeError(source_result["error"]))
+        divergence_count = sum(
+            len(item.get("divergences", []))
+            for item in result.get("sources", {}).values()
+        )
+        STORE.update(
+            run_id,
+            status="succeeded",
+            stage="completed",
+            completed_at=utc_now(),
+            duration_seconds=round(time.monotonic() - started_monotonic, 2),
+            rows=divergence_count,
+            file_name="Contrôle Odoo et Sellsy",
+            result=result,
+            error=None,
+        )
+    except Exception as error:
+        LOGGER.error("Synchronization check failed: %s", safe_error(error))
+        STORE.update(
+            run_id,
+            status="failed",
+            stage="failed",
+            completed_at=utc_now(),
+            duration_seconds=round(time.monotonic() - started_monotonic, 2),
+            error=safe_error(error),
+        )
+
+
+def start_sync_check_job() -> tuple[dict | None, str | None]:
+    with JOB_LOCK:
+        running = latest_running_job()
+        if running:
+            return None, running["id"]
+        record = STORE.create("sync_check")
+        thread = threading.Thread(
+            target=run_sync_check_job,
+            args=(record["id"],),
+            name=f"sync-check-{record['id'][:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return record, None
+
+
 def build_admin_status() -> dict:
     refresh_project_env()
     sources = collect_source_freshness(REPO_ROOT, APP_DIR)
-    history = STORE.list(25)
+    history = STORE.list(200)
     sellsy_config = sellsy_configuration_status()
     counts = {
         "fresh": sum(1 for source in sources if source["status"] == "fresh"),
@@ -354,6 +609,9 @@ def build_admin_status() -> dict:
             ),
             "sellsy_configured": sellsy_config["configured"],
             "sellsy_auth_mode": sellsy_config["auth_mode"],
+            "sellsy_experience_configured": bool(
+                sellsy_config.get("experience_configured")
+            ),
             "sellsy_configuration_error": sellsy_config["error"],
             "sellsy_import_directory": str(get_sellsy_source_dir()),
             "running_job_id": latest_running_job().get("id") if latest_running_job() else None,
@@ -460,8 +718,11 @@ class ReportingHandler(SimpleHTTPRequestHandler):
 
         supported_paths = {
             "/api/admin/integrations/odoo-timesheets",
+            "/api/admin/integrations/odoo-full-reconciliation",
             "/api/admin/integrations/sellsy-sources",
+            "/api/admin/integrations/sellsy-full-reconciliation",
             "/api/admin/report/rebuild",
+            "/api/admin/integrations/sync-check",
         }
         if parsed.path not in supported_paths:
             self._error(HTTPStatus.NOT_FOUND, "Route inconnue")
@@ -477,7 +738,21 @@ class ReportingHandler(SimpleHTTPRequestHandler):
                 return
             self._json(record, HTTPStatus.ACCEPTED)
             return
-        if parsed.path == "/api/admin/integrations/odoo-timesheets":
+        if parsed.path == "/api/admin/integrations/sync-check":
+            record, running_id = start_sync_check_job()
+            if running_id:
+                self._error(
+                    HTTPStatus.CONFLICT,
+                    "Une opération d'administration est déjà en cours",
+                    running_job_id=running_id,
+                )
+                return
+            self._json(record, HTTPStatus.ACCEPTED)
+            return
+        if parsed.path in {
+            "/api/admin/integrations/odoo-timesheets",
+            "/api/admin/integrations/odoo-full-reconciliation",
+        }:
             refresh_project_env()
             if not (os.environ.get("ODOO_LOGIN") and os.environ.get("ODOO_PASSWORD")):
                 self._error(
@@ -485,7 +760,8 @@ class ReportingHandler(SimpleHTTPRequestHandler):
                     "Configuration Odoo incomplète.",
                 )
                 return
-            record, running_id = start_odoo_job()
+            force_full = parsed.path.endswith("/odoo-full-reconciliation")
+            record, running_id = start_odoo_job(force_full=force_full)
             if running_id:
                 self._error(
                     HTTPStatus.CONFLICT,
@@ -495,13 +771,17 @@ class ReportingHandler(SimpleHTTPRequestHandler):
                 return
             self._json(record, HTTPStatus.ACCEPTED)
             return
-        if parsed.path == "/api/admin/integrations/sellsy-sources":
+        if parsed.path in {
+            "/api/admin/integrations/sellsy-sources",
+            "/api/admin/integrations/sellsy-full-reconciliation",
+        }:
             refresh_project_env()
             sellsy_state = sellsy_configuration_status()
             if not sellsy_state["configured"]:
                 self._error(HTTPStatus.BAD_REQUEST, "Configuration Sellsy API incomplète.")
                 return
-            record, running_id = start_sellsy_job()
+            force_full = parsed.path.endswith("/sellsy-full-reconciliation")
+            record, running_id = start_sellsy_job(force_full=force_full)
             if running_id:
                 self._error(
                     HTTPStatus.CONFLICT,

@@ -48,3 +48,29 @@ class ApplicationBoundaryTests(unittest.TestCase):
         self.assertNotIn('"quality": {', source)
         self.assertNotIn('"unlinkedProjects"', source)
         self.assertNotIn('"fictitiousCostProjects"', source)
+
+    def test_admin_exposes_manual_odoo_full_reconciliation(self):
+        backend = (ROOT / "reporting" / "backend" / "server.py").read_text(encoding="utf-8")
+        frontend = (ROOT / "reporting" / "dist" / "app.js").read_text(encoding="utf-8")
+
+        route = "/api/admin/integrations/odoo-full-reconciliation"
+        self.assertIn(route, backend)
+        self.assertIn(route, frontend)
+        self.assertIn('id="run-odoo-full-reconciliation"', frontend)
+
+    def test_admin_exposes_manual_sellsy_full_reconciliation(self):
+        backend = (ROOT / "reporting" / "backend" / "server.py").read_text(encoding="utf-8")
+        frontend = (ROOT / "reporting" / "dist" / "app.js").read_text(encoding="utf-8")
+
+        route = "/api/admin/integrations/sellsy-full-reconciliation"
+        self.assertIn(route, backend)
+        self.assertIn(route, frontend)
+        self.assertIn('id="run-sellsy-full-reconciliation"', frontend)
+
+    def test_unused_topbar_actions_are_removed(self):
+        index = (ROOT / "reporting" / "dist" / "index.html").read_text(encoding="utf-8")
+        app = (ROOT / "reporting" / "dist" / "app.js").read_text(encoding="utf-8")
+
+        self.assertNotIn('id="export-button"', index)
+        self.assertNotIn('aria-label="Notifications"', index)
+        self.assertNotIn("function exportCsv", app)

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import openpyxl
 
+from core.source_database import is_database_file, read_table, read_tables
 from core.sellsy_scope import SELLSY_DOCUMENT_START_ISO, is_sellsy_document_in_scope
 from core.snapshot_store import SOURCE_FILE_NAMES, active_source_files, active_source_provenance
 
@@ -184,20 +185,24 @@ def source_fingerprints(source_files: dict[str, Path] | None = None) -> dict[str
     """Return content fingerprints without ever modifying a source file."""
 
     fingerprints = {}
+    physical_fingerprints = {}
     for source_id, path in (source_files or _resolved_source_files()).items():
         if not path.is_file():
             raise ReportBuildError(f"Source requise absente : {path.relative_to(PROJECT_ROOT)}")
-        digest = hashlib.sha256()
-        with path.open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-        stat = path.stat()
-        fingerprints[source_id] = {
-            "path": str(path.resolve()),
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-            "sha256": digest.hexdigest(),
-        }
+        resolved = str(path.resolve())
+        if resolved not in physical_fingerprints:
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            stat = path.stat()
+            physical_fingerprints[resolved] = {
+                "path": resolved,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": digest.hexdigest(),
+            }
+        fingerprints[source_id] = dict(physical_fingerprints[resolved])
     return fingerprints
 
 
@@ -373,6 +378,7 @@ def normalize_bu(value) -> str:
         ("mandarineinterne", "Mandarine Interne"), ("dileaplogist", "Dileap Logistique"),
         ("dileapservice", "Dileap Services"), ("moocoffice", "MOOC Office 365"),
         ("dileapacademy", "Dileap Academy"), ("dileapcontent", "Dileap Content"),
+        ("mandarineexperience", "Mandarine Expérience"),
     )
     for marker, result in mappings:
         if marker in key:
@@ -380,18 +386,27 @@ def normalize_bu(value) -> str:
     return label.title() if label.isupper() else label
 
 
-def _project_default_bu(name: str) -> str:
-    upper = clean_text(name, "").upper()
-    if "INTERNE" in upper or upper.startswith("MANDEXP"):
+def _is_internal_project(project: dict) -> bool:
+    return (
+        "interne" in normalized_compact(project.get("name"))
+        or "mandarine" in normalized_compact(project.get("client"))
+        or normalized_compact(project.get("x_bu_projet")) == "mandarineinterne"
+    )
+
+
+def _project_default_bu(project: dict) -> str:
+    raw_bu = clean_text(project.get("x_bu_projet"), "")
+    configured_bu = normalize_bu(raw_bu) if raw_bu else ""
+    if configured_bu:
+        return configured_bu
+    upper = clean_text(project.get("name"), "").upper()
+    if _is_internal_project(project):
         return "Mandarine Interne"
+    if upper.startswith("MANDEXP"):
+        return "Mandarine Expérience"
     if upper.startswith("DL"):
         return "Dileap Logistique"
     return "Dileap Services" if upper else "BU non rattachée"
-
-
-def _is_internal_project(name: str) -> bool:
-    upper = clean_text(name, "").upper()
-    return "INTERNE" in upper or upper.startswith("MANDEXP")
 
 
 def _configured_pseudo_employee_ids() -> frozenset[str]:
@@ -472,6 +487,95 @@ def _read_sellsy(path: Path, kind: str) -> list[dict]:
         workbook.close()
 
 
+def _read_logical_source(
+    source_files: dict[str, Path], logical_table: str, *, sellsy_kind: str | None = None
+) -> list[dict]:
+    path = source_files[logical_table]
+    if is_database_file(path):
+        rows = read_table(path, logical_table)
+        if not sellsy_kind:
+            return rows
+        return [
+            {
+                "kind": sellsy_kind,
+                "id": clean_text(row.get("id"), ""),
+                "number": clean_text(row.get("number"), ""),
+                "date": as_date(row.get("date")),
+                "client_id": clean_text(row.get("client_id"), ""),
+                "client": clean_text(row.get("client"), ""),
+                "object": clean_text(row.get("object"), ""),
+                "amount": as_float(row.get("amount")),
+                "commercial": clean_text(row.get("commercial"), ""),
+                "bu": normalize_bu(row.get("bu")),
+                "owner": clean_text(row.get("owner"), ""),
+                "sale_type": clean_text(row.get("sale_type"), ""),
+                "platform_id": clean_text(row.get("platform_id"), "0"),
+                "project": clean_text(row.get("project"), ""),
+                "status": clean_text(row.get("status"), ""),
+                "order_id": clean_text(row.get("order_id"), ""),
+                "order_number": clean_text(row.get("order_number"), ""),
+                "delivery_date": as_date(row.get("delivery_date")),
+            }
+            for row in rows
+        ]
+    if sellsy_kind:
+        return _read_sellsy(path, sellsy_kind)
+    return _read_csv(path)
+
+
+def _read_all_logical_sources(source_files: dict[str, Path]) -> dict[str, list[dict]]:
+    """Read each physical SQLite database only once, including compressed revisions."""
+
+    loaded: dict[str, list[dict]] = {}
+    database_groups: dict[Path, list[str]] = defaultdict(list)
+    sellsy_kinds = {
+        "sellsy_orders": "order",
+        "sellsy_invoices": "invoice",
+        "sellsy_credit_notes": "credit-note",
+    }
+    for logical_table, path in source_files.items():
+        if is_database_file(path):
+            database_groups[path].append(logical_table)
+        else:
+            loaded[logical_table] = _read_logical_source(
+                source_files,
+                logical_table,
+                sellsy_kind=sellsy_kinds.get(logical_table),
+            )
+    for path, logical_tables in database_groups.items():
+        raw_tables = read_tables(path, logical_tables)
+        for logical_table, rows in raw_tables.items():
+            kind = sellsy_kinds.get(logical_table)
+            if not kind:
+                loaded[logical_table] = rows
+                continue
+            # Apply the canonical Sellsy normalization without reopening the database.
+            loaded[logical_table] = [
+                {
+                    "kind": kind,
+                    "id": clean_text(row.get("id"), ""),
+                    "number": clean_text(row.get("number"), ""),
+                    "date": as_date(row.get("date")),
+                    "client_id": clean_text(row.get("client_id"), ""),
+                    "client": clean_text(row.get("client"), ""),
+                    "object": clean_text(row.get("object"), ""),
+                    "amount": as_float(row.get("amount")),
+                    "commercial": clean_text(row.get("commercial"), ""),
+                    "bu": normalize_bu(row.get("bu")),
+                    "owner": clean_text(row.get("owner"), ""),
+                    "sale_type": clean_text(row.get("sale_type"), ""),
+                    "platform_id": clean_text(row.get("platform_id"), "0"),
+                    "project": clean_text(row.get("project"), ""),
+                    "status": clean_text(row.get("status"), ""),
+                    "order_id": clean_text(row.get("order_id"), ""),
+                    "order_number": clean_text(row.get("order_number"), ""),
+                    "delivery_date": as_date(row.get("delivery_date")),
+                }
+                for row in rows
+            ]
+    return loaded
+
+
 def _source_rows(metadata: dict, source_files: dict[str, Path]) -> list[dict]:
     definitions = (
         ("Clients Odoo", "Odoo", "odoo_clients", "Revision Odoo/clients.csv"),
@@ -490,7 +594,11 @@ def _source_rows(metadata: dict, source_files: dict[str, Path]) -> list[dict]:
         "name": name,
         "system": system,
         "file": str(source_files[key].resolve()),
-        "logicalFile": path,
+        "logicalFile": (
+            f"Revision {system}/{source_files[key].name}:{key}"
+            if is_database_file(source_files[key])
+            else path
+        ),
         "records": metadata[key]["records"],
         "lastDate": metadata[key].get("last_date"),
         "status": "success",
@@ -548,26 +656,27 @@ def _document_assignment(document, project_key_map, today):
 def build_payload(*, as_of: date | None = None, source_files: dict[str, Path] | None = None) -> dict:
     today = as_of or date.today()
     sources = source_files or _resolved_source_files()
+    loaded_sources = _read_all_logical_sources(sources)
     period_start, fiscal_end = fiscal_period(today)
     period_end = min(today, fiscal_end)
-    client_rows = _read_csv(sources["odoo_clients"])
-    odoo_order_rows = _read_csv(sources["odoo_orders"])
-    line_rows = _read_csv(sources["odoo_order_lines"])
-    project_source = _read_csv(sources["odoo_projects"])
-    task_rows = _read_csv(sources["odoo_tasks"])
-    time_rows = _read_csv(sources["odoo_times"])
-    fixed_cost_rows = _read_csv(sources["odoo_fixed_costs"])
-    collaborator_source = _read_csv(sources["odoo_collaborators"])
+    client_rows = loaded_sources["odoo_clients"]
+    odoo_order_rows = loaded_sources["odoo_orders"]
+    line_rows = loaded_sources["odoo_order_lines"]
+    project_source = loaded_sources["odoo_projects"]
+    task_rows = loaded_sources["odoo_tasks"]
+    time_rows = loaded_sources["odoo_times"]
+    fixed_cost_rows = loaded_sources["odoo_fixed_costs"]
+    collaborator_source = loaded_sources["odoo_collaborators"]
     sellsy_orders = [
-        item for item in _read_sellsy(sources["sellsy_orders"], "order")
+        item for item in loaded_sources["sellsy_orders"]
         if is_sellsy_document_in_scope(item.get("date"))
     ]
     invoices = [
-        item for item in _read_sellsy(sources["sellsy_invoices"], "invoice")
+        item for item in loaded_sources["sellsy_invoices"]
         if is_sellsy_document_in_scope(item.get("date"))
     ]
     credits = [
-        item for item in _read_sellsy(sources["sellsy_credit_notes"], "credit-note")
+        item for item in loaded_sources["sellsy_credit_notes"]
         if is_sellsy_document_in_scope(item.get("date"))
     ]
 
@@ -595,6 +704,7 @@ def build_payload(*, as_of: date | None = None, source_files: dict[str, Path] | 
             "id": row["id"], "name": clean_text(row.get("name")), "manager": employees.get(row.get("employee_id", ""), {}).get("name", "Non renseigné"),
             "partner_id": partner_id, "client_id": final_id, "client": clients.get(final_id, partner).get("name", "Client Odoo non renseigné"),
             "analytic_account_id": row.get("analytic_account_id", ""),
+            "x_bu_projet": clean_text(row.get("x_bu_projet")),
             "sale_line_id": row.get("sale_line_id", ""), "sale_order_id": row.get("sale_order_id", ""),
             "active": str(row.get("active", "")).casefold() == "true",
         }
@@ -777,11 +887,12 @@ def build_payload(*, as_of: date | None = None, source_files: dict[str, Path] | 
             person_month = person["months"][month_key(day)]
             person_month["hours"] += hours
             person_month["cost"] += cost
-            project_name = projects.get(project_id, {}).get("name", "")
+            time_project = projects.get(project_id, {})
+            project_name = time_project.get("name", "")
             task_name = tasks.get(task_id, {}).get("name", "")
             if _is_absence_time(project_name, task_name):
                 person_month["absence_hours"] += hours
-            elif project_name and _is_internal_project(project_name):
+            elif project_name and _is_internal_project(time_project):
                 person_month["internal_hours"] += hours
             elif project_name:
                 person_month["client_hours"] += hours
@@ -880,7 +991,7 @@ def build_payload(*, as_of: date | None = None, source_files: dict[str, Path] | 
     profiles = {}
     for project_id, project in projects.items():
         metadata = project_metadata[project_id]
-        profiles[project_id] = {"bu": metadata["bus"].most_common(1)[0][0] if metadata["bus"] else _project_default_bu(project["name"]), "platform_id": metadata["platforms"].most_common(1)[0][0] if metadata["platforms"] else "0"}
+        profiles[project_id] = {"bu": metadata["bus"].most_common(1)[0][0] if metadata["bus"] else _project_default_bu(project), "platform_id": metadata["platforms"].most_common(1)[0][0] if metadata["platforms"] else "0"}
 
     monthly_bu = defaultdict(lambda: {
         "hours": 0.0, "cost": 0.0, "laborCost": 0.0, "otherCosts": 0.0,
@@ -1011,7 +1122,7 @@ def build_payload(*, as_of: date | None = None, source_files: dict[str, Path] | 
         margin = net - stats["cost"]
         total_cost = stats["cost"] + fixed_stats["cost"]
         total_margin = net - total_cost
-        internal = _is_internal_project(project["name"])
+        internal = _is_internal_project(project)
         task_values = []
         for task in sorted(tasks_by_project.get(project_id, []), key=lambda item: item["name"].casefold()):
             task_stat = task_stats[task["id"]]; planned = task["planned_hours"]; consumed = task_stat["hours"]
@@ -1047,7 +1158,7 @@ def build_payload(*, as_of: date | None = None, source_files: dict[str, Path] | 
             "clientId": project["client_id"],
             "client": project["client"],
             "manager": project["manager"],
-            "bu": profiles.get(project_id, {}).get("bu", _project_default_bu(project["name"])),
+            "bu": profiles.get(project_id, {}).get("bu", _project_default_bu(project)),
             "active": project["active"],
             "internal": internal,
             "projectType": "Interne" if internal else "Client",
@@ -1106,14 +1217,14 @@ def build_payload(*, as_of: date | None = None, source_files: dict[str, Path] | 
                 "invoiced": round_metric(invoice_months[month]),
                 "credits": round_metric(credit_months[month]),
                 "revenue": round_metric(invoice_months[month] - credit_months[month]),
-                "bu": profiles.get(project_id, {}).get("bu", _project_default_bu(project["name"])),
+                "bu": profiles.get(project_id, {}).get("bu", _project_default_bu(project)),
             } for month in all_months],
         })
     project_rows.sort(key=lambda item: item["cost"], reverse=True)
 
     current_monthly = [row for row in monthly_rows if row["month"] in period_months]
     total_hours = sum(row["hours"] for row in current_monthly); total_cost = sum(row["totalCost"] for row in current_monthly); total_revenue = sum(row["revenue"] for row in current_monthly); total_orders = sum(row["orders"] for row in current_monthly)
-    internal_hours = sum(sum(month["hours"] for month in project["months"] if month["month"] in period_months) for project in project_rows if _is_internal_project(project["name"]))
+    internal_hours = sum(sum(month["hours"] for month in project["months"] if month["month"] in period_months) for project in project_rows if project["internal"])
 
     def current(rows):
         return [item for item in rows if item.get("date") and period_start <= date.fromisoformat(item["date"]) <= period_end]
@@ -1157,7 +1268,7 @@ def build_payload(*, as_of: date | None = None, source_files: dict[str, Path] | 
     )
 
     return {
-        "meta": {"generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"), "periodStart": period_start.isoformat(), "periodEnd": fiscal_end.isoformat(), "dataThrough": data_through.isoformat(), "asOf": today.isoformat(), "currency": "EUR", "sellsyDocumentStartDate": SELLSY_DOCUMENT_START_ISO, "months": month_range(starts[0], data_through), "defaultPeriod": f"{period_start.year}-{fiscal_end.year}", "fiscalPeriods": periods, "periodLabel": f"Exercice {period_start.year}–{fiscal_end.year}", "reportSchemaVersion": 4, "rulesetVersion": 3, "businessRules": {"projectTypeField": "projectType", "totalCostIncludesFixedCosts": True, "marginBasis": "netRevenue-totalCost", "timesheetControl": {"method": "global-weekday-capacity", "dailyHours": round_metric(TIME_CONTROL_DAILY_HOURS, 2), "conformThreshold": TIME_CONTROL_CONFORM_THRESHOLD, "watchThreshold": TIME_CONTROL_WATCH_THRESHOLD, "overageWatchThreshold": TIME_CONTROL_OVERAGE_WATCH_THRESHOLD, "absencesCountAsFilledTime": True, "presenceDatesAreInferred": True}}, "provenance": active_source_provenance() if source_files is None else {"mode": "explicit-source-set"}},
+        "meta": {"generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"), "periodStart": period_start.isoformat(), "periodEnd": fiscal_end.isoformat(), "dataThrough": data_through.isoformat(), "asOf": today.isoformat(), "currency": "EUR", "sellsyDocumentStartDate": SELLSY_DOCUMENT_START_ISO, "months": month_range(starts[0], data_through), "defaultPeriod": f"{period_start.year}-{fiscal_end.year}", "fiscalPeriods": periods, "periodLabel": f"Exercice {period_start.year}–{fiscal_end.year}", "reportSchemaVersion": 4, "rulesetVersion": 4, "businessRules": {"projectTypeField": "projectType", "totalCostIncludesFixedCosts": True, "marginBasis": "netRevenue-totalCost", "timesheetControl": {"method": "global-weekday-capacity", "dailyHours": round_metric(TIME_CONTROL_DAILY_HOURS, 2), "conformThreshold": TIME_CONTROL_CONFORM_THRESHOLD, "watchThreshold": TIME_CONTROL_WATCH_THRESHOLD, "overageWatchThreshold": TIME_CONTROL_OVERAGE_WATCH_THRESHOLD, "absencesCountAsFilledTime": True, "presenceDatesAreInferred": True}}, "provenance": active_source_provenance() if source_files is None else {"mode": "explicit-source-set"}},
         "summary": {"hours": round_metric(total_hours), "cost": round_metric(total_cost), "revenue": round_metric(total_revenue), "orders": round_metric(total_orders), "margin": round_metric(total_revenue - total_cost), "marginRate": round_metric((total_revenue - total_cost) / total_revenue * 100) if total_revenue > 0 else 0.0, "collaborators": len(collaborators), "projects": len(project_rows), "internalHours": round_metric(internal_hours), "internalShare": round_metric(internal_hours / total_hours * 100) if total_hours else 0.0},
         "monthlyBu": monthly_rows, "finance": {"invoiceStatuses": invoice_status_rows}, "collaborators": collaborators, "projects": project_rows, "sources": _source_rows(metadata, sources), "alerts": alerts,
         "controls": {

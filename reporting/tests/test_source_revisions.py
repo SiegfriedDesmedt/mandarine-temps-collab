@@ -64,6 +64,54 @@ class SourceRevisionStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Empreinte invalide"):
                 revisions.validate_revision("sellsy", staging, ["orders.xlsx"])
 
+    def test_failed_candidate_keeps_active_revision_and_cursor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pointer = root / "active_sources.json"
+            revisions_root = root / "revisions"
+            active_id = "odoo-active"
+            active_dir = revisions_root / "odoo" / active_id
+            active_dir.mkdir(parents=True)
+            (active_dir / "odoo.sqlite").write_bytes(b"active")
+            (active_dir / "manifest.json").write_text(json.dumps({
+                "schemaVersion": 2,
+                "source": "odoo",
+                "status": "validated",
+                "completedAt": "2026-11-15T10:00:00+00:00",
+                "synchronization": {"cursor": "2026-11-15T09:55:00+00:00"},
+            }), encoding="utf-8")
+            original_registry = {
+                "schemaVersion": 2,
+                "odoo": {"revisionId": active_id, "activatedAt": "2026-11-15T10:00:00+00:00"},
+            }
+            pointer.write_text(json.dumps(original_registry), encoding="utf-8")
+
+            with (
+                patch.object(revisions, "SOURCE_REVISIONS_DIR", revisions_root),
+                patch.object(revisions, "ACTIVE_SOURCES_POINTER", pointer),
+            ):
+                candidate_id, staging = revisions.create_staging_revision("odoo")
+                candidate = staging / "odoo.sqlite"
+                candidate.write_bytes(b"before")
+                descriptor = revisions.file_descriptor(candidate, relative_to=staging)
+                revisions.write_revision_manifest(staging, {
+                    "schemaVersion": 2,
+                    "source": "odoo",
+                    "revisionId": candidate_id,
+                    "status": "validated",
+                    "completedAt": "2026-11-16T10:00:00+00:00",
+                    "synchronization": {"cursor": "2026-11-16T09:55:00+00:00"},
+                    "files": [descriptor],
+                })
+                candidate.write_bytes(b"tampered")
+
+                with self.assertRaisesRegex(RuntimeError, "Empreinte invalide"):
+                    revisions.promote_revision(
+                        "odoo", candidate_id, staging, ["odoo.sqlite"]
+                    )
+
+            self.assertEqual(json.loads(pointer.read_text(encoding="utf-8")), original_registry)
+
 
 if __name__ == "__main__":
     unittest.main()

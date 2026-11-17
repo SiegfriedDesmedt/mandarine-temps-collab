@@ -23,6 +23,7 @@ const state = {
   adminError: null,
   adminLoading: false,
   adminPollTimer: null,
+  adminHistoryPage: 1,
 };
 
 const viewMeta = {
@@ -383,7 +384,11 @@ function filteredProjects() {
       const laborCost = Number(project.cost || 0);
       const fixedCosts = Number(project.fixedCosts || 0);
       const globalCost = Number(project.totalCost ?? (laborCost + fixedCosts));
-      const netRevenue = Number(project.netRevenue || 0);
+      const grossInvoicedAmount = Number(project.invoiceAmount || 0);
+      const creditedAmount = Number(project.creditAmount || 0);
+      const netRevenue = Number(
+        project.netRevenue ?? (grossInvoicedAmount - creditedAmount),
+      );
       const totalMargin = Number(project.totalMargin ?? (netRevenue - globalCost));
       const totalMarginRate = project.totalMarginRate ?? (netRevenue > 0 ? (totalMargin / netRevenue) * 100 : null);
       const odooStatus = project.active ? "En cours" : "Archivé";
@@ -397,7 +402,9 @@ function filteredProjects() {
         fixedCosts,
         globalCost,
         netRevenue,
-        invoicedAmount: Number(project.invoiceAmount || 0),
+        grossInvoicedAmount,
+        creditedAmount,
+        invoicedAmount: netRevenue,
         totalMargin,
         totalMarginRate,
         odooStatus,
@@ -767,6 +774,28 @@ function projectDetailPagination(items, key, pageSize = 5) {
   };
 }
 
+function adminHistoryPagination(items, pageSize = 10) {
+  const pages = Math.max(1, Math.ceil(items.length / pageSize));
+  const current = Math.min(state.adminHistoryPage || 1, pages);
+  state.adminHistoryPage = current;
+  const visible = new Set([1, pages]);
+  for (let page = Math.max(1, current - 2); page <= Math.min(pages, current + 2); page += 1) visible.add(page);
+  const pageNumbers = [...visible].sort((left, right) => left - right);
+  const buttons = [`<button type="button" data-admin-history-page="${Math.max(1, current - 1)}" ${current === 1 ? "disabled" : ""} aria-label="Page précédente">‹</button>`];
+  pageNumbers.forEach((page, index) => {
+    if (index && page - pageNumbers[index - 1] > 1) buttons.push('<span class="pagination-gap">…</span>');
+    buttons.push(`<button type="button" data-admin-history-page="${page}" class="${page === current ? "is-current" : ""}">${page}</button>`);
+  });
+  buttons.push(`<button type="button" data-admin-history-page="${Math.min(pages, current + 1)}" ${current === pages ? "disabled" : ""} aria-label="Page suivante">›</button>`);
+  const startIndex = (current - 1) * pageSize;
+  return {
+    rows: items.slice(startIndex, startIndex + pageSize),
+    start: items.length ? startIndex + 1 : 0,
+    end: Math.min(startIndex + pageSize, items.length),
+    html: pages > 1 ? `<nav class="pagination" aria-label="Pagination de l’historique">${buttons.join("")}</nav>` : "",
+  };
+}
+
 function monthControlTooltip(month) {
   const presentation = timeControlPresentation[month.status] || timeControlPresentation.unevaluated;
   const lines = [`Mois : ${formatMonthLabel(month.month, "long")}`, `Heures saisies : ${formatHours(month.hours)}`];
@@ -918,11 +947,11 @@ function renderProjects() {
       <div class="table-toolbar project-toolbar"><div><h2>Portefeuille projets</h2><p>Rentabilité cumulée toutes périodes, consolidée par les relations techniques Odoo.</p><div class="project-filter-bar" aria-label="Filtres globaux du tableau"><span class="project-filter-label">Filtres actifs</span><div class="active-filter-chips">${projectGlobalFilterChips || '<span class="project-filter-empty">Aucun filtre global</span>'}</div></div></div><span class="table-count">${projects.length} résultats</span></div>
       <div class="table-scroll"><table>
         <thead>
-          <tr><th>${sortableHeader("projects", "name", "Projet")}</th><th>${sortableHeader("projects", "client", "Client final")}</th><th>${sortableHeader("projects", "type", "Type de projet")}</th><th>${sortableHeader("projects", "manager", "Responsable")}</th><th>${sortableHeader("projects", "hours", "Heures cumulées")}</th><th>${sortableHeader("projects", "cost", "Coût global à date")}</th><th>${sortableHeader("projects", "revenue", "Commandé HT")}</th><th>${sortableHeader("projects", "invoiced", "Facturé HT")}</th><th>${sortableHeader("projects", "margin", "Marge sur facturé")}</th><th>${sortableHeader("projects", "odooStatus", "État Odoo")}</th></tr>
+          <tr><th>${sortableHeader("projects", "name", "Projet")}</th><th>${sortableHeader("projects", "client", "Client final")}</th><th>${sortableHeader("projects", "type", "Type de projet")}</th><th>${sortableHeader("projects", "manager", "Responsable")}</th><th>${sortableHeader("projects", "hours", "Heures cumulées")}</th><th>${sortableHeader("projects", "cost", "Coût global à date")}</th><th>${sortableHeader("projects", "revenue", "Commandé HT")}</th><th>${sortableHeader("projects", "invoiced", "Facturé net HT")}</th><th>${sortableHeader("projects", "margin", "Marge sur facturé")}</th><th>${sortableHeader("projects", "odooStatus", "État Odoo")}</th></tr>
           <tr class="column-filter-row"><th>${columnFilter("projects", "name", "Projet")}</th><th>${columnFilter("projects", "client", "Client")}</th><th>${columnFilter("projects", "type", "Type de projet")}</th><th>${columnFilter("projects", "manager", "Responsable")}</th><th>${columnFilter("projects", "hours", "Heures")}</th><th>${columnFilter("projects", "cost", "Coût à date")}</th><th>${columnFilter("projects", "revenue", "Commandé")}</th><th>${columnFilter("projects", "invoiced", "Facturé")}</th><th>${columnFilter("projects", "margin", "Marge")}</th><th><select class="column-filter project-state-filter" data-project-lifecycle aria-label="Filtrer l'état Odoo"><option value="active" ${state.projectLifecycle === "active" ? "selected" : ""}>En cours</option><option value="archived" ${state.projectLifecycle === "archived" ? "selected" : ""}>Archivés</option><option value="all" ${state.projectLifecycle === "all" ? "selected" : ""}>Tous</option></select></th></tr>
         </thead>
         <tbody>${rows.map((project) => {
-          return `<tr class="clickable-row" data-project-id="${esc(project.id)}" tabindex="0" aria-label="Ouvrir la fiche du projet ${esc(project.name)}"><td><div class="entity-cell"><span class="entity-icon">${esc(initials(project.name))}</span><div class="entity-label"><strong title="${esc(project.name)}">${esc(project.name)}</strong></div></div></td><td>${esc(project.client)}</td><td>${esc(project.type)}</td><td>${esc(project.manager)}</td><td>${esc(formatHours(project.globalHours))}</td><td><strong title="Main-d'œuvre ${esc(formatCurrency(project.laborCost))} · Coûts fixes échus ${esc(formatCurrency(project.fixedCosts))}">${esc(formatCurrency(project.globalCost))}</strong></td><td>${esc(formatCurrency(project.linkedOrders))}</td><td>${esc(formatCurrency(project.invoicedAmount))}</td><td style="color:${project.totalMargin < 0 ? "#c94343" : "#21865d"}">${project.netRevenue > 0 ? `${esc(formatCurrency(project.totalMargin))} (${esc(formatPercent(project.totalMarginRate))})` : "—"}</td><td><span class="pill ${project.active ? "" : "archived"}">${esc(project.odooStatus)}</span></td></tr>`;
+          return `<tr class="clickable-row" data-project-id="${esc(project.id)}" tabindex="0" aria-label="Ouvrir la fiche du projet ${esc(project.name)}"><td><div class="entity-cell"><span class="entity-icon">${esc(initials(project.name))}</span><div class="entity-label"><strong title="${esc(project.name)}">${esc(project.name)}</strong></div></div></td><td>${esc(project.client)}</td><td>${esc(project.type)}</td><td>${esc(project.manager)}</td><td>${esc(formatHours(project.globalHours))}</td><td><strong title="Main-d'œuvre ${esc(formatCurrency(project.laborCost))} · Coûts fixes échus ${esc(formatCurrency(project.fixedCosts))}">${esc(formatCurrency(project.globalCost))}</strong></td><td>${esc(formatCurrency(project.linkedOrders))}</td><td title="Factures ${esc(formatCurrency(project.grossInvoicedAmount))} · Avoirs −${esc(formatCurrency(project.creditedAmount))}">${esc(formatCurrency(project.invoicedAmount))}</td><td style="color:${project.totalMargin < 0 ? "#c94343" : "#21865d"}">${project.netRevenue > 0 ? `${esc(formatCurrency(project.totalMargin))} (${esc(formatPercent(project.totalMarginRate))})` : "—"}</td><td><span class="pill ${project.active ? "" : "archived"}">${esc(project.odooStatus)}</span></td></tr>`;
         }).join("")}</tbody>
       </table></div>
       <footer class="table-footer"><span>${projects.length ? (state.page - 1) * pageSize + 1 : 0}–${Math.min(state.page * pageSize, projects.length)} sur ${projects.length}</span>${pager.html}</footer>
@@ -1199,6 +1228,37 @@ async function startOdooIntegration() {
   }
 }
 
+async function startOdooFullReconciliation() {
+  const confirmed = window.confirm(
+    "La réconciliation complète recharge toutes les données Odoo et remplace la révision active après validation. Elle peut durer plusieurs minutes. Continuer ?",
+  );
+  if (!confirmed) return;
+  const button = document.querySelector("#run-odoo-full-reconciliation");
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<span class="button-spinner"></span> Démarrage…';
+  }
+  try {
+    const response = await fetch("/api/admin/integrations/odoo-full-reconciliation", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    showToast("La réconciliation complète Odoo a démarré en arrière-plan.");
+    await loadAdminStatus({ rerender: true });
+    monitorJob(
+      payload.id,
+      "La réconciliation complète Odoo est publiée. Actualisez maintenant les rapports.",
+      null,
+      { reloadReport: false },
+    );
+  } catch (error) {
+    showToast(`Impossible de démarrer la réconciliation : ${error.message}`);
+    await loadAdminStatus({ rerender: true });
+  }
+}
+
 async function startSellsyIntegration() {
   const button = document.querySelector("#run-sellsy-import");
   if (button) {
@@ -1221,6 +1281,80 @@ async function startSellsyIntegration() {
   }
 }
 
+async function startSellsyFullReconciliation() {
+  const confirmed = window.confirm(
+    "La réconciliation complète recharge toutes les commandes, factures et avoirs Sellsy, ainsi que les commandes Mandarine Expérience. Elle peut durer plusieurs minutes. Continuer ?",
+  );
+  if (!confirmed) return;
+  const button = document.querySelector("#run-sellsy-full-reconciliation");
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<span class="button-spinner"></span> Démarrage…';
+  }
+  try {
+    const response = await fetch("/api/admin/integrations/sellsy-full-reconciliation", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    showToast("La réconciliation complète Sellsy a démarré en arrière-plan.");
+    await loadAdminStatus({ rerender: true });
+    monitorJob(
+      payload.id,
+      "La réconciliation complète Sellsy est publiée. Actualisez maintenant les rapports.",
+      null,
+      { reloadReport: false },
+    );
+  } catch (error) {
+    showToast(`Impossible de démarrer la réconciliation Sellsy : ${error.message}`);
+    await loadAdminStatus({ rerender: true });
+  }
+}
+
+async function startSynchronizationCheck() {
+  const button = document.querySelector("#run-sync-check");
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<span class="button-spinner"></span> Vérification…';
+  }
+  try {
+    const response = await fetch("/api/admin/integrations/sync-check", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    showToast("Le contrôle en lecture seule a démarré.");
+    await loadAdminStatus({ rerender: true });
+    monitorJob(payload.id, "Le contrôle Odoo et Sellsy est terminé.", null, { reloadReport: false });
+  } catch (error) {
+    showToast(`Impossible de démarrer le contrôle : ${error.message}`);
+    await loadAdminStatus({ rerender: true });
+  }
+}
+
+function synchronizationCheckResult(job) {
+  const result = job?.result;
+  if (!result) return "";
+  const labels = { ok: "Conforme", divergence: "Divergence", warning: "Partiel", error: "Erreur" };
+  const sources = Object.values(result.sources || {});
+  return `<section class="panel table-panel" style="margin-bottom:14px">
+    <div class="table-toolbar"><div><h2>Dernier contrôle Odoo et Sellsy</h2><p>Contrôle distant borné et strictement en lecture seule, terminé le ${esc(formatDateTime(result.checkedAt))}.</p></div><span class="job-status ${esc(result.status)}">${esc(labels[result.status] || result.status)}</span></div>
+    <div class="sync-check-table-wrap"><table class="sync-check-table">
+      <thead><tr><th>Source</th><th>État</th><th>Dernière synchronisation</th><th>Dernière activité distante</th><th>Résultat</th><th>Limites</th></tr></thead>
+      <tbody>${sources.map((source) => `<tr>
+        <td data-label="Source"><strong>${esc(source.source === "odoo" ? "Odoo" : "Sellsy")}</strong><br><small>${esc(source.revisionId || "aucune révision")}</small></td>
+        <td data-label="État"><span class="job-status ${esc(source.status)}">${esc(labels[source.status] || source.status)}</span></td>
+        <td data-label="Dernière synchronisation">${esc(formatDateTime(source.lastSuccessfulSync))}</td>
+        <td data-label="Dernière activité distante">${esc(source.remoteLastUpdated ? formatDateTime(source.remoteLastUpdated) : "Non exposée")}</td>
+        <td data-label="Résultat">${source.error ? `<span class="job-error">${esc(source.error)}</span>` : source.divergences?.length ? esc(`${source.divergences.length} divergence(s) détectée(s)`) : "Aucune divergence sur les contrôles effectués"}</td>
+        <td data-label="Limites">${source.limitations?.length ? `<ul class="sync-limit-list">${source.limitations.map((limitation) => `<li>${esc(limitation)}</li>`).join("")}</ul>` : "—"}</td>
+      </tr>`).join("")}</tbody>
+    </table></div>
+  </section>`;
+}
+
 function renderAdmin() {
   if (!state.adminData) {
     appView.innerHTML = `
@@ -1237,30 +1371,21 @@ function renderAdmin() {
 
   const admin = state.adminData;
   const history = admin.history || [];
+  const historyPager = adminHistoryPagination(history, 10);
   const latestOdooSuccess = history.find((job) => job.integration === "odoo_timesheets" && job.status === "succeeded");
-  const latestSellsy = history.find((job) => job.integration === "sellsy_sources");
   const latestSellsySuccess = history.find((job) => job.integration === "sellsy_sources" && job.status === "succeeded");
+  const latestSyncCheck = history.find((job) => job.integration === "sync_check" && job.status === "succeeded" && job.result);
   const runningJob = history.find((job) => ["queued", "running"].includes(job.status));
   const runningOdoo = runningJob?.integration === "odoo_timesheets" ? runningJob : null;
   const runningSellsy = runningJob?.integration === "sellsy_sources" ? runningJob : null;
+  const runningSyncCheck = runningJob?.integration === "sync_check" ? runningJob : null;
   const credentialsReady = admin.backend.odoo_credentials_configured;
   const sellsyReady = admin.backend.sellsy_configured;
+  const sellsyExperienceReady = admin.backend.sellsy_experience_configured;
   const sources = [...admin.sources].sort((a, b) => {
     const rank = { missing: 0, stale: 1, warning: 2, fresh: 3 };
     return rank[a.status] - rank[b.status];
   });
-  const staleTotal = admin.freshness_counts.stale + admin.freshness_counts.missing;
-  const sellsyFiles = latestSellsy?.files || [
-    { source: "invoices", status: "pending" },
-    { source: "orders", status: "pending" },
-    { source: "credit-notes", status: "pending" },
-  ];
-  const sellsyFileResults = sellsyFiles.map((file) => {
-    const status = file.status === "succeeded" ? "Réussi" : file.status === "failed" ? "Échec" : file.status === "running" ? "En cours" : "En attente";
-    const size = file.size_bytes === null || file.size_bytes === undefined ? "" : ` · ${formatBytes(file.size_bytes)}`;
-    return `<span class="file-result ${esc(file.status || "pending")}"><strong>${esc(file.source)}</strong><span>${esc(status + size)}</span></span>`;
-  }).join("");
-
   appView.innerHTML = `
     <section class="admin-hero">
       <div class="integration-stack">
@@ -1275,30 +1400,41 @@ function renderAdmin() {
               <span class="meta-chip">${latestOdooSuccess ? numberFormatter.format(latestOdooSuccess.rows || 0) + " lignes" : "aucune exécution"}</span>
             </div>
           </div>
-          <button class="secondary-button" id="run-odoo-import" type="button" ${!credentialsReady || runningJob ? "disabled" : ""}>
-            ${runningOdoo ? '<span class="button-spinner"></span> Acquisition en cours' : "Acquérir Odoo"}
-          </button>
+          <div class="integration-actions">
+            <button class="secondary-button" id="run-odoo-import" type="button" ${!credentialsReady || runningJob ? "disabled" : ""}>
+              ${runningOdoo ? '<span class="button-spinner"></span> Acquisition en cours' : "Acquérir Odoo"}
+            </button>
+            <button class="secondary-button reconciliation-button" id="run-odoo-full-reconciliation" type="button" title="Recharge toutes les données Odoo et réconcilie notamment les suppressions" ${!credentialsReady || runningJob ? "disabled" : ""}>
+              ${runningOdoo?.requested_sync_mode === "full" ? '<span class="button-spinner"></span> Réconciliation en cours' : "Réconciliation complète"}
+            </button>
+          </div>
         </article>
         <article class="panel integration-card">
           <div class="integration-logo">S</div>
           <div class="integration-info">
             <h2>Acquérir les sources Sellsy</h2>
-            <p>Extraction Sellsy V2 indépendante et strictement en lecture seule, avec le détail des commandes nécessaire à l’analyse locale.</p>
+            <p>Extraction en lecture seule du Sellsy principal, complétée par les commandes du Sellsy Mandarine Expérience lorsqu’il est configuré.</p>
             <div class="integration-meta">
               <span class="meta-chip">Sellsy API V2</span>
+              <span class="meta-chip">Mandarine Expérience : ${sellsyExperienceReady ? "active" : "à configurer"}</span>
               <span class="meta-chip">${esc(admin.backend.active_sources?.sellsy?.revisionId || "migration")}</span>
               <span class="meta-chip">${latestSellsySuccess ? formatDateTime(latestSellsySuccess.completed_at) : "aucune exécution"}</span>
             </div>
           </div>
-          <button class="secondary-button" id="run-sellsy-import" type="button" ${!sellsyReady || runningJob ? "disabled" : ""}>
-            ${runningSellsy ? '<span class="button-spinner"></span> Acquisition en cours' : "Acquérir Sellsy"}
-          </button>
+          <div class="integration-actions">
+            <button class="secondary-button" id="run-sellsy-import" type="button" ${!sellsyReady || runningJob ? "disabled" : ""}>
+              ${runningSellsy ? '<span class="button-spinner"></span> Acquisition en cours' : "Acquérir Sellsy"}
+            </button>
+            <button class="secondary-button reconciliation-button" id="run-sellsy-full-reconciliation" type="button" title="Recharge toutes les données des deux environnements Sellsy configurés" ${!sellsyReady || runningJob ? "disabled" : ""}>
+              ${runningSellsy?.requested_sync_mode === "full" ? '<span class="button-spinner"></span> Réconciliation en cours' : "Réconciliation complète"}
+            </button>
+          </div>
         </article>
         <article class="panel integration-card report-rebuild-card">
           <div class="integration-logo">Rapport</div>
           <div class="integration-info">
             <h2>Actualiser les rapports</h2>
-            <p>Recalcule les rapports et l’analyse Sellsy → Odoo uniquement depuis les révisions locales actives. Aucun appel API n’est envoyé.</p>
+            <p>Recalcule les rapports uniquement depuis les révisions locales actives. Aucun appel API n’est envoyé.</p>
             <div class="integration-meta">
               <span class="meta-chip">Traitement local</span>
               <span class="meta-chip">Sans extraction ERP</span>
@@ -1309,17 +1445,28 @@ function renderAdmin() {
             ${runningJob?.integration === "report_rebuild" ? '<span class="button-spinner"></span> Recalcul en cours' : "↻ Actualiser les rapports"}
           </button>
         </article>
+        <article class="panel integration-card">
+          <div class="integration-logo">✓</div>
+          <div class="integration-info">
+            <h2>Vérifier la synchronisation Odoo et Sellsy</h2>
+            <p>Contrôle la connectivité, les volumes et les dates distantes avec des requêtes bornées, sans modifier ni resynchroniser les données.</p>
+            <div class="integration-meta">
+              <span class="meta-chip">Lecture seule</span>
+              <span class="meta-chip">Sans téléchargement exhaustif</span>
+              <span class="meta-chip">${latestSyncCheck ? esc(formatDateTime(latestSyncCheck.completed_at)) : "jamais exécuté"}</span>
+            </div>
+          </div>
+          <button class="secondary-button" id="run-sync-check" type="button" ${!credentialsReady || !sellsyReady || runningJob ? "disabled" : ""}>
+            ${runningSyncCheck ? '<span class="button-spinner"></span> Vérification en cours' : "Vérifier la synchronisation"}
+          </button>
+        </article>
       </div>
-      <article class="panel admin-summary">
-        <div class="admin-stat"><strong>${admin.freshness_counts.fresh}</strong><span>sources à jour</span></div>
-        <div class="admin-stat"><strong>${admin.freshness_counts.warning}</strong><span>sources à surveiller</span></div>
-        <div class="admin-stat"><strong style="color:${staleTotal ? "#c94343" : "#21865d"}">${staleTotal}</strong><span>sources obsolètes ou absentes</span></div>
-        <div class="admin-stat"><strong>${latestOdooSuccess ? numberFormatter.format(latestOdooSuccess.rows) : "—"}</strong><span>lignes du dernier export réussi</span></div>
-      </article>
     </section>
 
     ${!credentialsReady ? '<div class="alert-banner"><span class="alert-symbol">!</span><p><strong>Identifiants Odoo non configurés.</strong> Renseignez ODOO_LOGIN et ODOO_PASSWORD dans le fichier .env situé à la racine, puis cliquez sur Actualiser.</p></div>' : ""}
     ${!sellsyReady ? `<div class="alert-banner"><span class="alert-symbol">!</span><p><strong>API Sellsy non configurée.</strong> ${esc(admin.backend.sellsy_configuration_error || "Renseignez SELLSY_CLIENT_ID et SELLSY_CLIENT_SECRET dans le fichier .env.")}</p></div>` : ""}
+
+    ${synchronizationCheckResult(latestSyncCheck)}
 
     <section class="panel table-panel" style="margin-bottom:14px">
       <div class="table-toolbar"><div><h2>Fraîcheur des fichiers d’alimentation</h2><p>Le seuil attendu varie selon la fréquence métier de chaque source.</p></div><span class="table-count">${sources.length} sources suivies</span></div>
@@ -1341,9 +1488,9 @@ function renderAdmin() {
       <div class="table-toolbar"><div><h2>Historique des intégrations</h2><p>Les erreurs sont conservées sans identifiant, mot de passe ni secret API.</p></div><span class="table-count">${history.length} exécutions</span></div>
       <div class="table-scroll"><table>
         <thead><tr><th>Démarrage</th><th>Intégration</th><th>Statut</th><th>Étape</th><th>Lignes / fichiers</th><th>Durée</th><th>Fichier / erreur</th></tr></thead>
-        <tbody>${history.length ? history.map((job) => `<tr>
+        <tbody>${history.length ? historyPager.rows.map((job) => `<tr>
           <td>${esc(formatDateTime(job.started_at || job.created_at))}</td>
-          <td><strong>${job.integration === "full_sources_snapshot" ? "Instantané Sellsy & Odoo" : job.integration === "odoo_timesheets" ? "Sources Odoo" : job.integration === "sellsy_sources" ? "Sources Sellsy" : job.integration === "report_rebuild" ? "Recalcul du reporting" : esc(job.integration)}</strong></td>
+          <td><strong>${job.integration === "full_sources_snapshot" ? "Instantané Sellsy & Odoo" : job.integration === "odoo_timesheets" && job.requested_sync_mode === "full" ? "Réconciliation complète Odoo" : job.integration === "odoo_timesheets" ? "Sources Odoo" : job.integration === "sellsy_sources" && job.requested_sync_mode === "full" ? "Réconciliation complète Sellsy" : job.integration === "sellsy_sources" ? "Sources Sellsy" : job.integration === "report_rebuild" ? "Recalcul du reporting" : job.integration === "sync_check" ? "Contrôle des synchronisations" : esc(job.integration)}</strong></td>
           <td><span class="job-status ${esc(job.status)}">${esc(integrationStatusLabel(job.status))}</span></td>
           <td>${esc(job.stage || "—")}</td>
           <td>${job.integration === "sellsy_sources" && Number(job.total || 0) > 0
@@ -1355,6 +1502,7 @@ function renderAdmin() {
           <td>${job.error ? `<span class="job-error" title="${esc(job.error)}">${esc(job.error)}</span>` : esc(job.file_name || "—")}</td>
         </tr>`).join("") : '<tr><td colspan="7">Aucune intégration exécutée depuis ce backend.</td></tr>'}</tbody>
       </table></div>
+      <footer class="table-footer"><span>${historyPager.start}–${historyPager.end} sur ${history.length}</span>${historyPager.html}</footer>
     </section>`;
 }
 
@@ -1382,6 +1530,7 @@ function setView(view) {
   if (!["overview", "collaborators", "projects", "admin"].includes(view)) return;
   state.view = view;
   state.page = 1;
+  if (view === "admin") state.adminHistoryPage = 1;
   state.selectedProjectId = null;
   document.body.classList.remove("menu-open");
   render();
@@ -1395,45 +1544,6 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add("is-visible");
   window.setTimeout(() => toast.classList.remove("is-visible"), 2800);
-}
-
-function exportCsv() {
-  let headers;
-  let rows;
-  if (state.view === "collaborators") {
-    const months = collaboratorPeriodMonths();
-    headers = ["Collaborateur", "Métier", ...months.map((month) => formatMonthLabel(month, "long")), "Total", "Lecture"];
-    rows = filteredCollaborators().map((person) => [
-      person.name,
-      person.department,
-      ...months.map((month) => person.control.monthByKey.get(month)?.hours ?? 0),
-      person.control.totalHours,
-      person.status[0],
-    ]);
-  } else if (state.view === "projects") {
-    headers = ["Projet", "Client final Odoo", "Type de projet", "Responsable", "État Odoo", "Heures cumulées", "Coût MO cumulé", "Coûts fixes cumulés", "Coût global", "Commandé HT", "Facturé HT", "Avoirs HT", "CA net", "Marge globale"];
-    rows = filteredProjects().map((project) => [project.name, project.client, project.type, project.manager, project.odooStatus, project.globalHours, project.laborCost, project.fixedCosts, project.globalCost, project.orderAmount, project.invoiceAmount, project.creditAmount, project.netRevenue, project.totalMargin]);
-  } else if (state.view === "admin" && state.adminData) {
-    headers = ["Source", "Système", "Format", "Dernière modification", "Âge (heures)", "Taille", "État"];
-    rows = state.adminData.sources.map((source) => [source.name, source.system, source.format, source.modified_at, source.age_hours, source.size_bytes, source.status]);
-  } else {
-    headers = ["Mois", "Business unit", "Commandé HT", "Factures HT", "Avoirs HT", "CA net facturé HT", "Coût main-d’œuvre HT", "Autres coûts HT", "Coûts totaux HT", "Marge opérationnelle"];
-    const months = new Set(activeMonths());
-    rows = state.data.monthlyBu
-      .filter((row) => months.has(row.month) && (state.bu === "all" || row.bu === state.bu))
-      .map((row) => [row.month, row.bu, row.orders, row.invoiceAmount, row.creditAmount, row.revenue, row.laborCost ?? row.cost, row.otherCosts, row.totalCost ?? (Number(row.cost || 0) + Number(row.otherCosts || 0)), Number(row.revenue || 0) - Number(row.totalCost ?? (Number(row.cost || 0) + Number(row.otherCosts || 0)))]);
-  }
-  const csv = [headers, ...rows]
-    .map((row) => row.map((cell) => `"${String(cell ?? "").replaceAll('"', '""')}"`).join(";"))
-    .join("\n");
-  const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `mandarine-${state.view}-${new Date().toISOString().slice(0, 10)}.csv`;
-  link.click();
-  URL.revokeObjectURL(url);
-  showToast("Export CSV généré avec les filtres actifs.");
 }
 
 function bindEvents() {
@@ -1468,7 +1578,6 @@ function bindEvents() {
     render();
   });
   document.querySelector("#open-sources").addEventListener("click", () => setView("admin"));
-  document.querySelector("#export-button").addEventListener("click", exportCsv);
   document.querySelector("#mobile-menu").addEventListener("click", () => document.body.classList.toggle("menu-open"));
   appView.addEventListener("click", (event) => {
     const collaboratorInsufficientButton = event.target.closest("[data-collaborator-insufficient]");
@@ -1482,13 +1591,24 @@ function bindEvents() {
     if (reportRebuildButton && !reportRebuildButton.disabled) startReportRebuild();
     const runButton = event.target.closest("#run-odoo-import");
     if (runButton && !runButton.disabled) startOdooIntegration();
+    const fullOdooButton = event.target.closest("#run-odoo-full-reconciliation");
+    if (fullOdooButton && !fullOdooButton.disabled) startOdooFullReconciliation();
     const runSellsyButton = event.target.closest("#run-sellsy-import");
     if (runSellsyButton && !runSellsyButton.disabled) startSellsyIntegration();
+    const fullSellsyButton = event.target.closest("#run-sellsy-full-reconciliation");
+    if (fullSellsyButton && !fullSellsyButton.disabled) startSellsyFullReconciliation();
+    const syncCheckButton = event.target.closest("#run-sync-check");
+    if (syncCheckButton && !syncCheckButton.disabled) startSynchronizationCheck();
     const viewButton = event.target.closest("[data-go-view]");
     if (viewButton) setView(viewButton.dataset.goView);
     const pageButton = event.target.closest("[data-page]");
     if (pageButton) {
       state.page = Number(pageButton.dataset.page);
+      render();
+    }
+    const adminHistoryPageButton = event.target.closest("[data-admin-history-page]");
+    if (adminHistoryPageButton) {
+      state.adminHistoryPage = Number(adminHistoryPageButton.dataset.adminHistoryPage);
       render();
     }
     const projectDetailPageButton = event.target.closest("[data-project-detail-page]");

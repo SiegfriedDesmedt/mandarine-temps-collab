@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .source_database import existing_database_path
 from .source_revision_store import active_revision, file_descriptor, load_active_sources
 
 
@@ -21,7 +22,11 @@ SOURCE_FILE_NAMES = {
 
 
 def active_source_files() -> dict[str, Path]:
-    """Return the eleven reporting files from the two active revisions."""
+    """Return a compatible handle for every logical reporting source.
+
+    New revisions point every logical table of a source to its SQLite database.
+    Historical CSV/XLSX revisions keep their original per-file paths.
+    """
 
     if not load_active_sources():
         raise RuntimeError("Le registre des sources actives est absent")
@@ -35,10 +40,12 @@ def active_source_files() -> dict[str, Path]:
         "odoo": Path(odoo_revision["path"]),
         "sellsy": Path(sellsy_revision["path"]),
     }
-    paths = {
-        key: roots["odoo" if key.startswith("odoo_") else "sellsy"] / filename
-        for key, filename in SOURCE_FILE_NAMES.items()
-    }
+    paths = {}
+    for key, filename in SOURCE_FILE_NAMES.items():
+        source = "odoo" if key.startswith("odoo_") else "sellsy"
+        root = roots[source]
+        source_database = existing_database_path(root, source)
+        paths[key] = source_database if source_database else root / filename
     missing = [str(path) for path in paths.values() if not path.is_file()]
     if missing:
         raise RuntimeError("Revisions actives incompletes : " + ", ".join(missing))
@@ -64,6 +71,11 @@ def active_source_provenance() -> dict:
             "completedAt": manifest.get("completedAt"),
             "schemaVersion": manifest.get("schemaVersion"),
             "records": manifest.get("records", 0),
+            "storageFormat": (manifest.get("storage") or {}).get(
+                "format", "legacy-files"
+            ),
+            "syncMode": (manifest.get("synchronization") or {}).get("mode", "full"),
+            "cursor": (manifest.get("synchronization") or {}).get("cursor"),
             "manifestSha256": file_descriptor(
                 Path(revision["path"]) / "manifest.json"
             )["sha256"],

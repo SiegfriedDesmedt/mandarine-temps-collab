@@ -67,12 +67,20 @@ class SellsyReadOnlyClient:
         self._opener = build_opener(_IPv4HTTPSHandler())
 
     @classmethod
-    def from_env(cls):
+    def from_env(
+        cls,
+        client_id_key: str = "SELLSY_CLIENT_ID",
+        client_secret_key: str = "SELLSY_CLIENT_SECRET",
+    ):
         try:
             timeout = max(1, int(os.environ.get("SELLSY_API_TIMEOUT_SECONDS", "30")))
         except ValueError:
             timeout = 30
-        return cls(os.environ.get("SELLSY_CLIENT_ID", "").strip(), os.environ.get("SELLSY_CLIENT_SECRET", "").strip(), timeout=float(timeout))
+        return cls(
+            os.environ.get(client_id_key, "").strip(),
+            os.environ.get(client_secret_key, "").strip(),
+            timeout=float(timeout),
+        )
 
     def _access_token(self) -> str:
         if self._token and time.monotonic() < self._expires_at:

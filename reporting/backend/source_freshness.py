@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core.source_database import is_database_file
 from core.snapshot_store import active_source_files, active_source_provenance
 
 
@@ -52,11 +53,14 @@ def collect_source_freshness(_repo_root: Path, app_dir: Path) -> list[dict]:
         source_key = "sellsy" if system.startswith("Sellsy") else "odoo"
         source_provenance = provenance.get(source_key)
         location = f"Révision {source_provenance['revisionId']}"
+        storage_path = paths[key]
+        actual_format = "SQLite.gz" if storage_path.name.casefold().endswith(".sqlite.gz") else "SQLite" if is_database_file(storage_path) else file_format
+        displayed_name = f"{storage_path.name}:{key}" if actual_format == "SQLite" else filename
         definition = {
             "id": source_id, "name": name, "system": system,
-            "relative_path": f"{location}/{system.split()[0]}/{filename}",
+            "relative_path": f"{location}/{system.split()[0]}/{displayed_name}",
             "expected_hours": 48 if system.startswith("Sellsy") else 24,
-            "format": file_format,
+            "format": actual_format,
         }
-        sources.append(_describe_file(paths[key], definition, now, counts.get(name.casefold())))
+        sources.append(_describe_file(storage_path, definition, now, counts.get(name.casefold())))
     return sources

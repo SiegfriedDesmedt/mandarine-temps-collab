@@ -77,6 +77,7 @@ EXPORT_SPECS = (
             "name",
             "employee_id",
             "partner_id",
+            "x_bu_projet",
             "analytic_account_id",
             "sale_line_id",
             "sale_order_id",
@@ -454,9 +455,14 @@ def _export_model(
     notify_progress: ProgressCallback,
     prior_rows: int,
     employee_id_by_user: dict[int, int],
+    modified_since: str | None = None,
 ) -> dict:
     available = _available_fields(models, uid, password, spec, logger)
     requested_fields = [field for field in spec.fields if field in available]
+    if modified_since and "write_date" not in available:
+        raise OdooSchemaError(
+            f"Synchronisation incrémentale impossible sur {spec.model} : write_date absent"
+        )
     derives_employee_id = spec.model in DERIVED_EMPLOYEE_MODELS
     if derives_employee_id:
         if "user_id" not in available:
@@ -474,13 +480,16 @@ def _export_model(
         writer.writeheader()
 
         while True:
+            domain = [["id", ">", last_id], *[list(condition) for condition in spec.domain]]
+            if modified_since:
+                domain.append(["write_date", ">=", modified_since])
             rows = _execute_kw(
                 models,
                 uid,
                 password,
                 spec.model,
                 "search_read",
-                [[["id", ">", last_id], *[list(condition) for condition in spec.domain]]],
+                [domain],
                 {
                     "fields": requested_fields,
                     "limit": batch_size,
@@ -502,13 +511,20 @@ def _export_model(
                             employee_id_by_user.get(int(user_id), "") if user_id else ""
                         )
                     else:
-                        output_row[field] = (
-                            _serialize_value(
-                                row.get(field), available.get(field, {}).get("type")
+                        field_type = available.get(field, {}).get("type")
+                        value = row.get(field)
+                        if field == "x_bu_projet" and field_type == "many2one":
+                            output_row[field] = (
+                                str(value[1])
+                                if isinstance(value, (list, tuple)) and len(value) > 1
+                                else ""
                             )
-                            if field in available
-                            else ""
-                        )
+                        else:
+                            output_row[field] = (
+                                _serialize_value(value, field_type)
+                                if field in available
+                                else ""
+                            )
                 if spec.filename == "commandes.csv":
                     output_row["date_order"] = _format_date_fr(output_row["date_order"])
                 writer.writerow(output_row)
@@ -692,6 +708,7 @@ def _export_fixed_costs(
     logger: logging.Logger,
     notify_progress: ProgressCallback,
     prior_rows: int,
+    modified_since: str | None = None,
 ) -> dict:
     """Export the three fixed-cost product families without altering Odoo."""
 
@@ -725,6 +742,10 @@ def _export_fixed_costs(
         frozenset({"id", "date", "account_id", "product_id", "unit_amount", "amount"}),
     )
     available = _available_fields(models, uid, password, analytic_spec, logger)
+    if modified_since and "write_date" not in available:
+        raise OdooSchemaError(
+            "Synchronisation incrémentale impossible sur account.analytic.line : write_date absent"
+        )
     requested_fields = [field for field in analytic_fields if field in available]
     output_path = staging_dir / FIXED_COST_FILENAME
     total = 0
@@ -735,16 +756,19 @@ def _export_fixed_costs(
         writer.writeheader()
         if products_by_id:
             while True:
+                domain = [
+                    ["id", ">", last_id],
+                    ["product_id", "in", sorted(products_by_id)],
+                ]
+                if modified_since:
+                    domain.append(["write_date", ">=", modified_since])
                 rows = _execute_kw(
                     models,
                     uid,
                     password,
                     "account.analytic.line",
                     "search_read",
-                    [[
-                        ["id", ">", last_id],
-                        ["product_id", "in", sorted(products_by_id)],
-                    ]],
+                    [domain],
                     {
                         "fields": requested_fields,
                         "limit": batch_size,
@@ -876,8 +900,9 @@ def export_odoo(
     progress_callback: ProgressCallback | None = None,
     *,
     destination_dir: Path | None = None,
+    modified_since: str | None = None,
 ) -> dict:
-    """Export the eight reporting source files and publish them as one set."""
+    """Export full sources or rows modified since an Odoo UTC timestamp."""
 
     login = os.environ.get("ODOO_LOGIN", "").strip()
     password = os.environ.get("ODOO_PASSWORD", "")
@@ -967,6 +992,7 @@ def export_odoo(
                 notify_progress,
                 cumulative_rows,
                 employee_id_by_user,
+                modified_since,
             )
             results.append(result)
             cumulative_rows += result["rows"]
@@ -985,6 +1011,7 @@ def export_odoo(
             logger,
             notify_progress,
             cumulative_rows,
+            modified_since,
         )
         results.append(fixed_cost_result)
         cumulative_rows += fixed_cost_result["rows"]
@@ -1016,6 +1043,8 @@ def export_odoo(
             "duration_seconds": duration,
             "started_at": started_at.isoformat(),
             "completed_at": completed_at.isoformat(),
+            "sync_mode": "incremental" if modified_since else "full",
+            "modified_since": modified_since,
             "files": results,
         }
     except Exception:

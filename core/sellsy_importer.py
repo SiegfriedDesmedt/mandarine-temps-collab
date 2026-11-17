@@ -18,6 +18,8 @@ ProgressCallback = Callable[[dict], None]
 SOURCE_NAMES = ("orders", "invoices", "credit-notes")
 DOCUMENT_PATHS = {"orders": "/orders", "invoices": "/invoices", "credit-notes": "/credit-notes"}
 WORKBOOK_NAMES = {name: f"{name}.xlsx" for name in SOURCE_NAMES}
+EXPERIENCE_CLIENT_ID_KEY = "SELLSY_EXPERIENCE_CLIENT_ID"
+EXPERIENCE_CLIENT_SECRET_KEY = "SELLSY_EXPERIENCE_CLIENT_SECRET"
 HEADERS = (
     "ID", "Numéro", "Date", "Client", "Objet", "Montant HT",
     "commercialmandarine", "bu-mbs", "cpmbs", "type-vente", "idplf", "project",
@@ -51,7 +53,20 @@ def get_configuration() -> dict:
         workers = int(os.environ.get("SELLSY_API_WORKERS", "4"))
     except ValueError as error:
         raise SellsyConfigurationError("SELLSY_API_WORKERS doit être un entier") from error
-    return {"auth_mode": "oauth2_client_credentials", "workers": min(max(workers, 1), 8)}
+    experience_id = os.environ.get(EXPERIENCE_CLIENT_ID_KEY, "").strip()
+    experience_secret = os.environ.get(EXPERIENCE_CLIENT_SECRET_KEY, "").strip()
+    if bool(experience_id) != bool(experience_secret):
+        missing_experience = (
+            EXPERIENCE_CLIENT_SECRET_KEY if experience_id else EXPERIENCE_CLIENT_ID_KEY
+        )
+        raise SellsyConfigurationError(
+            f"Configuration Sellsy Mandarine Expérience incomplète : {missing_experience}"
+        )
+    return {
+        "auth_mode": "oauth2_client_credentials",
+        "workers": min(max(workers, 1), 8),
+        "experience_configured": bool(experience_id and experience_secret),
+    }
 
 
 def configuration_status() -> dict:
@@ -59,7 +74,12 @@ def configuration_status() -> dict:
         config = get_configuration()
     except SellsyConfigurationError as error:
         return {"configured": False, "auth_mode": None, "error": str(error)}
-    return {"configured": True, "auth_mode": config["auth_mode"], "error": None}
+    return {
+        "configured": True,
+        "auth_mode": config["auth_mode"],
+        "experience_configured": config["experience_configured"],
+        "error": None,
+    }
 
 
 def _configure_logger() -> logging.Logger:
@@ -85,7 +105,12 @@ def _close_file_handlers(logger: logging.Logger) -> None:
 
 def _safe_message(error: Exception) -> str:
     message = str(error)
-    for key in ("SELLSY_CLIENT_ID", "SELLSY_CLIENT_SECRET"):
+    for key in (
+        "SELLSY_CLIENT_ID",
+        "SELLSY_CLIENT_SECRET",
+        EXPERIENCE_CLIENT_ID_KEY,
+        EXPERIENCE_CLIENT_SECRET_KEY,
+    ):
         secret = os.environ.get(key, "")
         if secret:
             message = message.replace(secret, "***")
@@ -176,7 +201,13 @@ def _custom_value(field: dict):
     return value if value is not None else ""
 
 
-def _list_documents(client: SellsyReadOnlyClient, source_name: str, *, limit: int = 100) -> list[dict]:
+def _list_documents(
+    client: SellsyReadOnlyClient,
+    source_name: str,
+    *,
+    limit: int = 100,
+    updated_since: str | None = None,
+) -> list[dict]:
     path = DOCUMENT_PATHS[source_name]
     rows: list[dict] = []
     retrieved_count = 0
@@ -186,9 +217,12 @@ def _list_documents(client: SellsyReadOnlyClient, source_name: str, *, limit: in
         query = {"limit": min(max(limit, 1), 100), "order": "id", "direction": "asc", "embed[]": "company"}
         if offset:
             query["offset"] = offset
+        filters = {"date": {"start": SELLSY_DOCUMENT_START_ISO}}
+        if updated_since:
+            filters["updated"] = {"start": updated_since}
         payload = client.search_endpoint(
             f"{path}/search",
-            filters={"date": {"start": SELLSY_DOCUMENT_START_ISO}},
+            filters=filters,
             query=query,
         )
         page = payload.get("data") or []
@@ -240,6 +274,60 @@ def _normalize(document: dict, custom_fields: dict) -> dict:
     }
 
 
+def _experience_storage_id(document_id) -> str:
+    raw_id = str(document_id or "").strip()
+    if not raw_id.isdigit() or int(raw_id) <= 0:
+        raise SellsyImportError(
+            "Identifiant de commande Sellsy Mandarine Expérience invalide"
+        )
+    # Les identifiants Sellsy sont propres à chaque société. Le signe négatif
+    # réserve un espace stable et sans collision à Mandarine Expérience.
+    return str(-int(raw_id))
+
+
+def _normalized_documents(
+    client: SellsyReadOnlyClient,
+    source_name: str,
+    *,
+    workers: int,
+    notify,
+    updated_since: str | None,
+    stage_prefix: str = "sellsy",
+    experience_namespace: bool = False,
+) -> list[dict]:
+    documents = _list_documents(client, source_name, updated_since=updated_since)
+    custom_by_id: dict[str, dict] = {}
+    total = len(documents)
+    if source_name != "invoices":
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sellsy-read") as executor:
+            futures = {
+                executor.submit(
+                    _load_custom_fields, client, source_name, row.get("id")
+                ): str(row.get("id"))
+                for row in documents
+            }
+            for processed, future in enumerate(as_completed(futures), start=1):
+                custom_by_id[futures[future]] = future.result()
+                if processed == 1 or processed % 50 == 0 or processed == total:
+                    notify(f"{stage_prefix}:details:{source_name}", processed, total)
+    if source_name == "invoices" and any(_parent(row)[0] == "delivery" for row in documents):
+        delivery_order_links = _load_delivery_order_links(client, notify)
+        for row in documents:
+            parent_type, parent_id = _parent(row)
+            link = delivery_order_links.get(parent_id) if parent_type == "delivery" else None
+            if link:
+                row["order"] = {"type": "order", "id": link["order_id"]}
+                row["delivery_date"] = link["date"]
+    normalized = [
+        _normalize(row, custom_by_id.get(str(row.get("id")), {}))
+        for row in documents
+    ]
+    if experience_namespace:
+        for row in normalized:
+            row["id"] = _experience_storage_id(row["id"])
+    return normalized
+
+
 def _write_workbook(path: Path, rows: list[dict]) -> None:
     workbook = openpyxl.Workbook(write_only=True)
     sheet = workbook.create_sheet("Données")
@@ -274,14 +362,22 @@ def _publish_directory(staging_dir: Path, source_dir: Path) -> None:
 def import_sellsy(
     progress_callback: ProgressCallback | None = None, *, destination_dir: Path | None = None,
     client: SellsyReadOnlyClient | None = None,
+    experience_client: SellsyReadOnlyClient | None = None,
+    updated_since: str | None = None,
 ) -> dict:
-    """Read all reporting documents through Sellsy API V2; never call a write endpoint."""
+    """Read full or modified reporting documents; never call a write endpoint."""
     config = get_configuration()
     source_dir = Path(destination_dir).resolve() if destination_dir else get_source_dir()
     source_dir.parent.mkdir(parents=True, exist_ok=True)
     staging_dir = source_dir.parent / f".{source_dir.name}.staging-{uuid.uuid4().hex}"
     staging_dir.mkdir()
     api = client or SellsyReadOnlyClient.from_env()
+    experience_api = experience_client
+    if experience_api is None and config["experience_configured"]:
+        experience_api = SellsyReadOnlyClient.from_env(
+            EXPERIENCE_CLIENT_ID_KEY,
+            EXPERIENCE_CLIENT_SECRET_KEY,
+        )
     logger = _configure_logger()
     started_at = datetime.now(timezone.utc)
     started_monotonic = time.monotonic()
@@ -295,39 +391,44 @@ def import_sellsy(
         for index, source_name in enumerate(SOURCE_NAMES):
             file_results[index]["status"] = "running"
             notify(f"sellsy:list:{source_name}")
-            documents = _list_documents(api, source_name)
-            custom_by_id: dict[str, dict] = {}
-            total = len(documents)
-            if source_name != "invoices":
-                with ThreadPoolExecutor(max_workers=config["workers"], thread_name_prefix="sellsy-read") as executor:
-                    futures = {executor.submit(_load_custom_fields, api, source_name, row.get("id")): str(row.get("id")) for row in documents}
-                    for processed, future in enumerate(as_completed(futures), start=1):
-                        custom_by_id[futures[future]] = future.result()
-                        if processed == 1 or processed % 50 == 0 or processed == total:
-                            notify(f"sellsy:details:{source_name}", processed, total)
-            delivery_order_links = {}
-            if source_name == "invoices" and any(_parent(row)[0] == "delivery" for row in documents):
-                delivery_order_links = _load_delivery_order_links(api, notify)
-                for row in documents:
-                    parent_type, parent_id = _parent(row)
-                    link = delivery_order_links.get(parent_id) if parent_type == "delivery" else None
-                    if link:
-                        row["order"] = {"type": "order", "id": link["order_id"]}
-                        row["delivery_date"] = link["date"]
-            normalized = [
-                _normalize(
-                    row,
-                    custom_by_id.get(str(row.get("id")), {}),
+            normalized = _normalized_documents(
+                api,
+                source_name,
+                workers=config["workers"],
+                notify=notify,
+                updated_since=updated_since,
+            )
+            primary_records = len(normalized)
+            experience_records = 0
+            if source_name == "orders" and experience_api is not None:
+                notify("sellsy-experience:list:orders")
+                experience_orders = _normalized_documents(
+                    experience_api,
+                    "orders",
+                    workers=config["workers"],
+                    notify=notify,
+                    updated_since=updated_since,
+                    stage_prefix="sellsy-experience",
+                    experience_namespace=True,
                 )
-                for row in documents
-            ]
+                experience_records = len(experience_orders)
+                normalized.extend(experience_orders)
             workbook_path = staging_dir / WORKBOOK_NAMES[source_name]
             _write_workbook(workbook_path, normalized)
             file_results[index] = {
                 "source": source_name, "status": "succeeded", "file_name": WORKBOOK_NAMES[source_name],
                 "size_bytes": workbook_path.stat().st_size, "records": len(normalized),
+                "primary_records": primary_records,
+                "experience_records": experience_records,
             }
-            logger.info("Source Sellsy %s extraite par API : %s enregistrements", source_name, len(normalized))
+            logger.info(
+                "Source Sellsy %s extraite par API : %s enregistrements "
+                "(%s principal, %s Mandarine Expérience)",
+                source_name,
+                len(normalized),
+                primary_records,
+                experience_records,
+            )
         notify("sellsy:publication")
         _publish_directory(staging_dir, source_dir)
         return {
@@ -337,6 +438,9 @@ def import_sellsy(
             "duration_seconds": round(time.monotonic() - started_monotonic, 2),
             "started_at": started_at.isoformat(), "completed_at": datetime.now(timezone.utc).isoformat(),
             "auth_mode": config["auth_mode"], "files": file_results,
+            "experience_configured": config["experience_configured"],
+            "sync_mode": "incremental" if updated_since else "full",
+            "updated_since": updated_since,
         }
     except (SellsyConfigurationError, SellsyImportError):
         raise
