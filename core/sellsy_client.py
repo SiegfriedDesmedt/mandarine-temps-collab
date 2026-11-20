@@ -20,13 +20,15 @@ class SellsyReadError(RuntimeError):
     pass
 
 
-def _ipv4_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
-    """Open an IPv4 socket when Windows exposes an unusable IPv6 route."""
+def _dual_stack_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+    """Prefer IPv4, then fall back to IPv6 when the active network requires it."""
     host, port = address
     last_error = None
-    for family, socktype, proto, _canonical, sockaddr in socket.getaddrinfo(
-        host, port, socket.AF_INET, socket.SOCK_STREAM
-    ):
+    addresses = socket.getaddrinfo(
+        host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
+    )
+    addresses.sort(key=lambda candidate: candidate[0] != socket.AF_INET)
+    for family, socktype, proto, _canonical, sockaddr in addresses:
         connection = None
         try:
             connection = socket.socket(family, socktype, proto)
@@ -45,15 +47,15 @@ def _ipv4_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_add
     raise OSError(f"Aucune adresse IPv4 disponible pour {host}")
 
 
-class _IPv4HTTPSConnection(http.client.HTTPSConnection):
+class _DualStackHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._create_connection = _ipv4_connection
+        self._create_connection = _dual_stack_connection
 
 
-class _IPv4HTTPSHandler(HTTPSHandler):
+class _DualStackHTTPSHandler(HTTPSHandler):
     def https_open(self, request):
-        return self.do_open(_IPv4HTTPSConnection, request)
+        return self.do_open(_DualStackHTTPSConnection, request)
 
 
 class SellsyReadOnlyClient:
@@ -64,7 +66,7 @@ class SellsyReadOnlyClient:
             raise SellsyReadError("SELLSY_CLIENT_ID et SELLSY_CLIENT_SECRET sont requis.")
         self.client_id, self.client_secret, self.timeout = client_id, client_secret, timeout
         self._token, self._expires_at = "", 0.0
-        self._opener = build_opener(_IPv4HTTPSHandler())
+        self._opener = build_opener(_DualStackHTTPSHandler())
 
     @classmethod
     def from_env(

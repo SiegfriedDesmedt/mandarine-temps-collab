@@ -47,6 +47,12 @@ def valid_payload(marker: str = "one") -> dict:
 
 
 class ReliableLocalDeploymentTests(unittest.TestCase):
+    def test_server_fingerprint_includes_shared_core_modules(self):
+        self.assertIn(
+            REPO_ROOT / "core" / "sellsy_client.py",
+            local_environment.server_code_paths(),
+        )
+
     def test_backend_code_change_invalidates_running_server_state(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"REPORTING_RUNTIME_DIR": directory}

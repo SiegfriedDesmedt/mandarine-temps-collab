@@ -51,6 +51,7 @@ from reporting.backend.report_builder import (
     working_day_count,
 )
 from core.sellsy_importer import get_configuration as get_sellsy_configuration, import_sellsy
+from core.sellsy_client import _dual_stack_connection
 from core.source_database import build_source_database, read_table
 from reporting.backend.source_freshness import collect_source_freshness
 from configure_odoo import save_env_values
@@ -525,6 +526,26 @@ class OdooExporterTests(unittest.TestCase):
 
         self.assertEqual(result["rows"], 0)
         self.assertGreaterEqual(progress.call_count, 8)
+
+
+class SellsyNetworkTests(unittest.TestCase):
+    def test_connection_falls_back_to_ipv6_when_ipv4_is_blocked(self):
+        ipv4_socket = Mock()
+        ipv4_socket.connect.side_effect = PermissionError("IPv4 blocked")
+        ipv6_socket = Mock()
+
+        addresses = [
+            (2, 1, 6, "", ("192.0.2.1", 443)),
+            (23, 1, 6, "", ("2001:db8::1", 443, 0, 0)),
+        ]
+        with patch("core.sellsy_client.socket.getaddrinfo", return_value=addresses), patch(
+            "core.sellsy_client.socket.socket", side_effect=[ipv4_socket, ipv6_socket]
+        ):
+            connection = _dual_stack_connection(("login.sellsy.com", 443), timeout=10)
+
+        self.assertIs(connection, ipv6_socket)
+        ipv4_socket.close.assert_called_once_with()
+        ipv6_socket.connect.assert_called_once_with(("2001:db8::1", 443, 0, 0))
 
 
 class SellsyApiImporterTests(unittest.TestCase):

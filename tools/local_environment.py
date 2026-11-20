@@ -50,11 +50,19 @@ def server_state_path() -> Path:
     return runtime_dir() / "local-server.json"
 
 
+def server_code_paths() -> list[Path]:
+    """Return every Python module loaded by the long-running local process."""
+    return [
+        RUN_BACKEND,
+        *sorted((APP_DIR / "backend").glob("*.py")),
+        *sorted((REPO_ROOT / "core").glob("*.py")),
+    ]
+
+
 def server_code_fingerprint() -> str:
-    """Identify backend code loaded by the long-running local process."""
+    """Identify backend and shared-core code loaded by the local process."""
     digest = hashlib.sha256()
-    paths = [RUN_BACKEND, *sorted((APP_DIR / "backend").glob("*.py"))]
-    for path in paths:
+    for path in server_code_paths():
         digest.update(str(path.relative_to(REPO_ROOT)).replace("\\", "/").encode("utf-8"))
         digest.update(path.read_bytes())
     return digest.hexdigest()
